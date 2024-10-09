@@ -18,7 +18,7 @@ int main() {
     };
 
     size_t max_size = static_cast<size_t>(8) * 1024 * 1024 * 1024;
-    lru_cache<int, std::vector<int>> cache(max_size, retrieveFunc); // 8 GB max RAM usage
+    tnt::lru_cache<int, std::vector<int>> cache(max_size, retrieveFunc); // 8 GB max RAM usage
 
     auto data1 = cache.get(1);
     auto data2 = cache.get(2);
