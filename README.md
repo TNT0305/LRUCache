@@ -49,6 +49,7 @@ int main() {
 
     return 0;
 }
+```
 ## Requirements
 - **C++20** or later
 - **Intel TBB** library (can be installed via vcpkg)
