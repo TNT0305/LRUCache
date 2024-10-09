@@ -1,14 +1,11 @@
 #pragma once
 
-#include <concepts>
-#include <unordered_map>
-#include <unordered_set>
-#include <list>
+#include <tbb/concurrent_unordered_map.h>
 #include <memory>
 #include <mutex>
 #include <functional>
 #include <condition_variable>
-#include <vector>
+#include <unordered_set>
 
 // Define the HasCapacity concept
 template <typename T>
@@ -35,13 +32,20 @@ size_t getSize(const std::shared_ptr<T>& value) {
     return sizeof(*value);
 }
 
+// Define the getSize concept
+template <typename T>
+concept HasGetSize = requires (const T & value) {
+    { getSize(value) } -> std::convertible_to<size_t>;
+};
+
+
 template<typename Key, typename Value>
-    requires requires(Value value) { getSize(value); }
+    requires HasGetSize<Value>
 class lru_cache {
 public:
     using RetrieveFunc = std::function<std::shared_ptr<Value>(const Key&)>;
 
-    lru_cache(size_t maxRamUsageBytes, RetrieveFunc retrieveFunc, size_t thrashingWindow = 100, size_t cleanUpThreshold = 10)
+    lru_cache(size_t maxRamUsageBytes, RetrieveFunc retrieveFunc, size_t thrashingWindow = 100, size_t cleanUpThreshold = 100)
         : maxRamUsageBytes(maxRamUsageBytes), thrashingWindow(thrashingWindow), cleanUpThreshold(cleanUpThreshold), retrieveFunc(retrieveFunc) {
         thrashingMetrics.resize(thrashingWindow, false);
     }
@@ -56,6 +60,9 @@ public:
             auto it = cache.find(key);
             if (it != cache.end()) {
                 // Move the accessed item to the front of the list
+                auto& s = it->second;
+                auto& sf = s.first;
+                auto& ss = s.second;
                 items.splice(items.begin(), items, it->second.second);
                 return it->second.first;
             }
@@ -71,7 +78,7 @@ public:
             }
 
             // If a retrieval is already in progress for this key, wait
-            while (retrieving_keys.count(key) > 0) {
+            while (retrieving_keys.contains(key)) {
                 retrieve_cond.wait(lock);
             }
 
@@ -112,8 +119,8 @@ private:
     size_t requestCount = 0;
     std::vector<bool> thrashingMetrics;
     std::list<Key> items;
-    std::unordered_map<Key, std::pair<std::shared_ptr<Value>, typename std::list<Key>::iterator>> cache;
-    std::unordered_map<Key, std::weak_ptr<Value>> secondary_storage;
+    tbb::concurrent_unordered_map<Key, std::pair<std::shared_ptr<Value>, typename std::list<Key>::iterator>> cache;
+    tbb::concurrent_unordered_map<Key, std::weak_ptr<Value>> secondary_storage;
     std::unordered_set<Key> retrieving_keys;
     std::mutex mutex;
     std::condition_variable retrieve_cond;
@@ -132,6 +139,7 @@ private:
 
         currentRamUsageBytes += getSize(value);
 
+        bool evicted = false;
         while (currentRamUsageBytes > maxRamUsageBytes && !items.empty()) {
             // Evict the least recently used item
             Key evicted_key = items.back();
@@ -144,12 +152,12 @@ private:
             if (evicted_item->second.first.use_count() > 1) {
                 secondary_storage[evicted_key] = evicted_item->second.first;
             }
-            cache.erase(evicted_key);
+            cache.unsafe_erase(evicted_key);
 
             evictionCount++;
-            thrashingMetrics[requestCount % thrashingWindow] = true;
+            evicted = true;
         }
-        thrashingMetrics[requestCount % thrashingWindow] = false;
+        thrashingMetrics[requestCount % thrashingWindow] = evicted;
         requestCount++;
 
         if (evictionCount >= cleanUpThreshold) {
@@ -167,7 +175,7 @@ private:
     void cleanUpSecondary() {
         for (auto it = secondary_storage.begin(); it != secondary_storage.end();) {
             if (it->second.expired()) {
-                it = secondary_storage.erase(it);
+                it = secondary_storage.unsafe_erase(it);
             }
             else {
                 ++it;
@@ -185,3 +193,4 @@ private:
         std::condition_variable& cv;
     };
 };
+

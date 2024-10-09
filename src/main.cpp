@@ -6,7 +6,7 @@ class MyClass {
 public:
     std::shared_ptr<std::vector<int>> retrieve(const int& key) {
         auto rv = std::make_shared<std::vector<int>>(std::initializer_list<int>{key, key + 1, key + 2});
-        rv->reserve(static_cast<size_t>(1) * 1024 * 1024 * 1024);
+        rv->reserve(static_cast<size_t>(1) * 1024 * 1024 * 512);
         return rv;
     }
 };
@@ -23,6 +23,7 @@ int main() {
     auto data1 = cache.get(1);
     auto data2 = cache.get(2);
     auto data3 = cache.get(3);
+    for (int i = 0; i < 20; ++i) cache.get(i);
 
     std::cout << "Data1: " << data1->at(0) << std::endl;
 
