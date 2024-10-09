@@ -49,3 +49,73 @@ int main() {
 
     return 0;
 }
+## Requirements
+- **C++20** or later
+- **Intel TBB** library (can be installed via vcpkg)
+
+## Building
+Make sure to have [vcpkg](https://github.com/microsoft/vcpkg) installed and TBB available. Use the following CMake setup:
+
+### CMakeLists.txt
+```cmake
+cmake_minimum_required(VERSION 3.21)
+project(LRUCacheExample)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED True)
+
+set(CMAKE_TOOLCHAIN_FILE "${CMAKE_CURRENT_SOURCE_DIR}/vcpkg/scripts/buildsystems/vcpkg.cmake" CACHE STRING "Vcpkg toolchain file")
+
+find_package(TBB REQUIRED)
+
+add_executable(LRUCacheExample src/main.cpp)
+
+target_link_libraries(LRUCacheExample PRIVATE TBB::tbb)
+
+###CMakePresets.json
+{
+  "version": 3,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 21,
+    "patch": 0
+  },
+  "presets": [
+    {
+      "name": "default",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "YES"
+      }
+    },
+    {
+      "name": "windows",
+      "inherits": "default",
+      "description": "Configure for Windows with Clang and vcpkg",
+      "toolchainFile": "C:/path/to/vcpkg/scripts/buildsystems/vcpkg.cmake",
+      "architecture": {
+        "value": "x64"
+      },
+      "generator": "Ninja",
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "clang-cl",
+        "CMAKE_CXX_COMPILER": "clang-cl"
+      }
+    },
+    {
+      "name": "linux",
+      "inherits": "default",
+      "description": "Configure for Linux with Clang and vcpkg",
+      "toolchainFile": "/path/to/vcpkg/scripts/buildsystems/vcpkg.cmake",
+      "generator": "Ninja",
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "clang",
+        "CMAKE_CXX_COMPILER": "clang++"
+      }
+    }
+  ]
+}
+###License
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
