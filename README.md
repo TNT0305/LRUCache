@@ -74,7 +74,7 @@ add_executable(LRUCacheExample src/main.cpp)
 target_link_libraries(LRUCacheExample PRIVATE TBB::tbb)
 ```
 
-###CMakePresets.json
+### CMakePresets.json
 ```cmake
 {
   "version": 3,
@@ -121,5 +121,5 @@ target_link_libraries(LRUCacheExample PRIVATE TBB::tbb)
   ]
 }
 ```
-###License
+### License
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
