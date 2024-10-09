@@ -1,5 +1,6 @@
 #pragma once
 
+#include <iostream>
 #include <tbb/concurrent_unordered_map.h>
 #include <memory>
 #include <mutex>
@@ -38,6 +39,15 @@ concept HasGetSize = requires (const T & value) {
     { getSize(value) } -> std::convertible_to<size_t>;
 };
 
+template<typename Key>
+bool isValidIterator(const typename std::list<Key>::iterator& it, const std::list<Key>& lst) {
+    for (auto listIt = lst.begin(); listIt != lst.end(); ++listIt) {
+        if (listIt == it) {
+            return true;
+        }
+    }
+    return false;
+}
 
 template<typename Key, typename Value>
     requires HasGetSize<Value>
@@ -60,10 +70,14 @@ public:
             auto it = cache.find(key);
             if (it != cache.end()) {
                 // Move the accessed item to the front of the list
-                auto& s = it->second;
-                auto& sf = s.first;
-                auto& ss = s.second;
-                items.splice(items.begin(), items, it->second.second);
+                if (isValidIterator(it->second.second, items)) {
+                    items.splice(items.begin(), items, it->second.second);
+                }
+                else {
+                    // Reinsert item if iterator is invalid
+                    items.push_front(key);
+                    it->second.second = items.begin();
+                }
                 return it->second.first;
             }
 
@@ -78,7 +92,7 @@ public:
             }
 
             // If a retrieval is already in progress for this key, wait
-            while (retrieving_keys.contains(key)) {
+            while (retrieving_keys.count(key) > 0) {
                 retrieve_cond.wait(lock);
             }
 
@@ -126,50 +140,63 @@ private:
     std::condition_variable retrieve_cond;
     RetrieveFunc retrieveFunc;
 
-    void putInternal(const Key& key, std::shared_ptr<Value> value, bool fromSecondary) {
+    void putInternal(const Key key, std::shared_ptr<Value> value, bool fromSecondary) {
         auto it = cache.find(key);
-        if (it != cache.end()) {
+        if (it != cache.end() && isValidIterator(it->second.second, items)) {
             // Update the value and move to front
             items.splice(items.begin(), items, it->second.second);
             currentRamUsageBytes -= getSize(it->second.first);
             it->second.first = value;
             currentRamUsageBytes += getSize(value);
-            return;
         }
-
-        currentRamUsageBytes += getSize(value);
-
-        bool evicted = false;
-        while (currentRamUsageBytes > maxRamUsageBytes && !items.empty()) {
-            // Evict the least recently used item
-            Key evicted_key = items.back();
-            items.pop_back();
-            auto evicted_item = cache.find(evicted_key);
-
-            currentRamUsageBytes -= getSize(evicted_item->second.first);
-
-            // Move to secondary storage
-            if (evicted_item->second.first.use_count() > 1) {
-                secondary_storage[evicted_key] = evicted_item->second.first;
+        else {
+            // Handle new insertion or invalid iterator
+            if (it == cache.end()) {
+                currentRamUsageBytes += getSize(value);
             }
-            cache.unsafe_erase(evicted_key);
+            else {
+                currentRamUsageBytes -= getSize(it->second.first);
+                currentRamUsageBytes += getSize(value);
+            }
 
-            evictionCount++;
-            evicted = true;
+            while (currentRamUsageBytes > maxRamUsageBytes && !items.empty()) {
+                // Evict the least recently used item
+                const Key evicted_key = items.back();
+                items.pop_back();
+                auto evicted_item = cache.find(evicted_key);
+
+                currentRamUsageBytes -= getSize(evicted_item->second.first);
+
+                // Move to secondary storage
+                if (evicted_item->second.first.use_count() > 1) {
+                    secondary_storage[evicted_key] = evicted_item->second.first;
+                }
+                cache.unsafe_erase(evicted_key);
+
+                evictionCount++;
+                thrashingMetrics[requestCount % thrashingWindow] = true;
+            }
+            thrashingMetrics[requestCount % thrashingWindow] = false;
+            requestCount++;
+
+            if (evictionCount >= cleanUpThreshold) {
+                cleanUpSecondary();
+                evictionCount = 0;
+            }
+
+            if (!fromSecondary) {
+                items.push_front(key);
+            }
+            else {
+                items.insert(items.begin(), key);
+            }
+
+            cache[key] = { value, items.begin() };
         }
-        thrashingMetrics[requestCount % thrashingWindow] = evicted;
-        requestCount++;
+    }
 
-        if (evictionCount >= cleanUpThreshold) {
-            cleanUpSecondary();
-            evictionCount = 0;
-        }
-
-        if (!fromSecondary) {
-            items.push_front(key);
-        }
-
-        cache[key] = { value, items.begin() };
+    bool isValidIterator(const typename std::list<Key>::iterator& it, const std::list<Key>& lst) {
+        return it != lst.end();
     }
 
     void cleanUpSecondary() {
