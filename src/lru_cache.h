@@ -9,6 +9,19 @@
 #include <unordered_set>
 
 namespace tnt {
+    template <typename Callable>
+    class finally {
+    public:
+        explicit finally(Callable&& callable) : callable(std::move(callable)) {}
+
+        ~finally() {
+            callable();
+        }
+
+    private:
+        Callable callable;
+    };
+
     // Define the HasCapacity concept
     template <typename T>
     concept HasCapacity = requires (const T & value) {
@@ -61,7 +74,7 @@ namespace tnt {
             thrashingMetrics.resize(thrashingWindow, false);
         }
 
-        std::shared_ptr<Value> get(const Key& key) {
+        std::optional<std::shared_ptr<Value>> get(const Key& key) {
             std::shared_ptr<Value> value;
 
             {
@@ -93,7 +106,7 @@ namespace tnt {
                 }
 
                 // If a retrieval is already in progress for this key, wait
-                while (retrieving_keys.count(key) > 0) {
+                while (retrieving_keys.contains(key)) {
                     retrieve_cond.wait(lock);
                 }
 
@@ -104,13 +117,30 @@ namespace tnt {
                 // Ensure notify_all is always called
                 NotifyGuard notifyGuard(retrieve_cond);
 
-                // Retrieve the value outside the mutex
-                value = retrieveFunc(key);
-                lock.lock();
-                putInternal(key, value, false);
-                retrieving_keys.erase(key);
+                // Scope guard to ensure cleanup (act as a "finally" block)
+                finally cleanup([&] {
+                    retrieving_keys.erase(key);
+                    });
 
-                return value;
+            	// Retrieve the value outside the mutex
+                try {
+                    value = retrieveFunc(key);
+                }
+                catch (const std::exception& e) {
+                    // Handle the exception, e.g., log an error and return a default value
+                    std::cerr << "Error retrieving value: " << e.what() << std::endl;
+                    return std::nullopt;
+                }
+                lock.lock();
+                if (value != nullptr) {
+                    putInternal(key, value, false);
+                    return value;
+                }
+                // Handle cache miss or error
+                return std::nullopt;
+
+                // REMINDER*********
+                // NotifyGuard and cleanup will be called on return because of RAII
             }
         }
 
