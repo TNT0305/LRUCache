@@ -103,7 +103,7 @@ int main() {
 
     std::cout << "Random access of " << numElements << " elements took " << elapsed.count() << " seconds.\n";
 
-    std::cout << "Thrashing metrics (last " << thashing_window_size << " requests): " << cache.getThrashingMetrics() << std::endl;
+    std::cout << "Thrashing metrics (last " << thashing_window_size << " requests): " << cache.get_thrashing_metrics() << std::endl;
 
     return 0;
 }

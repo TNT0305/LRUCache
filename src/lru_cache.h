@@ -9,48 +9,95 @@
 #include <unordered_set>
 
 namespace tnt {
-    template <typename Callable>
+    // Define a concept to check if a callable is noexcept
+    template <typename Callable, typename... Args>
+    concept NoexceptInvocable = std::invocable<Callable, Args...> && noexcept(std::invoke(std::declval<Callable>(), std::declval<Args>()...));
+
+    template <std::invocable Callable>
     class finally {
     public:
-        explicit finally(Callable&& callable) : callable(std::move(callable)) {}
+        explicit finally(Callable && callable) noexcept
+            : callable_(std::move(callable)), active_(true) {}
 
-        ~finally() {
-            callable();
+        finally(finally && other) noexcept
+            : callable_(std::move(other.callable_)), active_(other.active_) {
+            other.active_ = false;
         }
 
+        finally& operator=(finally && other) noexcept {
+            if (this != &other) {
+                if (active_) {
+                    call();
+                }
+                callable_ = std::move(other.callable_);
+                active_ = other.active_;
+                other.active_ = false;
+            }
+            return *this;
+        }
+
+        ~finally() noexcept {
+            if (active_) {
+                call();
+            }
+        }
+
+        // Delete copy constructor and copy assignment operator
+        finally(const finally&) = delete;
+        finally& operator=(const finally&) = delete;
+
     private:
-        Callable callable;
+        Callable callable_;
+        bool active_;
+
+        // Call the callable, with or without exception handling based on noexcept
+        void call() noexcept {
+            if constexpr (NoexceptInvocable<Callable>) {
+                callable_();
+            }
+            else {
+                try {
+                    callable_();
+                }
+                catch (const std::exception& e) {
+                    std::cerr << "Exception in finally destructor: " << e.what() << '\n';
+                }
+                catch (...) {
+                    std::cerr << "Unknown exception in finally destructor\n";
+                }
+            }
+        }
     };
 
-    // Define the HasCapacity concept
+    // Define the HasCapacity concept with noexcept requirement
     template <typename T>
     concept HasCapacity = requires (const T & value) {
-        { value.capacity() } -> std::convertible_to<size_t>;
+        { value.capacity() } noexcept -> std::convertible_to<size_t>;
     };
 
     // Default getSize implementation for types with capacity()
     template <typename T>
         requires HasCapacity<T>
-    size_t getSize(const T& value) {
+    size_t get_size(const T& value) noexcept {
         return sizeof(T) + value.capacity() * sizeof(typename T::value_type);
     }
     // Default getSize implementation for types with capacity()
     template <typename T>
         requires HasCapacity<T>
-    size_t getSize(const std::shared_ptr<T>& value) {
+    size_t get_size(const std::shared_ptr<T>& value) noexcept {
         return sizeof(T) + value->capacity() * sizeof(typename T::value_type);
     }
 
     // Fallback getSize implementation for types without capacity()
     template <typename T>
-    size_t getSize(const std::shared_ptr<T>& value) {
+    size_t get_size(const std::shared_ptr<T>& value) noexcept {
         return sizeof(*value);
     }
 
     // Define the getSize concept
     template <typename T>
     concept HasGetSize = requires (const T & value) {
-        { getSize(value) } -> std::convertible_to<size_t>;
+        { get_size(value) } noexcept -> std::convertible_to<size_t>;
     };
 
     template<typename Key>
@@ -63,91 +110,104 @@ namespace tnt {
         return false;
     }
 
+    template <typename Func, typename Key, typename Value>
+    concept RetrieveFunc = requires(Func func, const Key & key) {
+        { func(key) } -> std::convertible_to<std::shared_ptr<Value>>;
+    };
+    template <typename Func, typename Key, typename Value>
+    concept NoexceptRetrieveFunc = requires(Func func, const Key & key) {
+        { func(key) } noexcept -> std::convertible_to<std::shared_ptr<Value>>;
+    };
+
     template<typename Key, typename Value>
-        requires HasGetSize<Value>
+        requires HasGetSize<Value> && RetrieveFunc<std::function<std::shared_ptr<Value>(const Key&)>, Key, Value>
     class lru_cache {
     public:
-        using RetrieveFunc = std::function<std::shared_ptr<Value>(const Key&)>;
+        using RetrieveFuncType = std::function<std::shared_ptr<Value>(const Key&)>;
 
-        lru_cache(size_t maxRamUsageBytes, RetrieveFunc retrieveFunc, size_t thrashingWindow = 100, size_t cleanUpThreshold = 100)
-            : maxRamUsageBytes(maxRamUsageBytes), thrashingWindow(thrashingWindow), cleanUpThreshold(cleanUpThreshold), retrieveFunc(retrieveFunc) {
-            thrashingMetrics.resize(thrashingWindow, false);
+        lru_cache(const size_t max_ram_usage_bytes, RetrieveFuncType retrieve_func, const size_t thrashing_window = 100, const size_t clean_up_threshold = 100)
+            : max_ram_usage_bytes_(max_ram_usage_bytes), thrashing_window_(thrashing_window), clean_up_threshold_(clean_up_threshold), retrieve_func_(std::move(retrieve_func)) {
+            thrashing_metrics_.resize(thrashing_window, false);
         }
 
         std::optional<std::shared_ptr<Value>> get(const Key& key) {
             std::shared_ptr<Value> value;
 
             {
-                std::unique_lock<std::mutex> lock(mutex);
+                std::unique_lock<std::mutex> lock(mutex_);
 
                 // Check primary cache
-                auto it = cache.find(key);
-                if (it != cache.end()) {
+                auto it = cache_.find(key);
+                if (it != cache_.end()) {
                     // Move the accessed item to the front of the list
-                    if (isValidIterator(it->second.second, items)) {
-                        items.splice(items.begin(), items, it->second.second);
+                    if (isValidIterator(it->second.second, items_)) {
+                        items_.splice(items_.begin(), items_, it->second.second);
                     }
                     else {
                         // Reinsert item if iterator is invalid
-                        items.push_front(key);
-                        it->second.second = items.begin();
+                        items_.push_front(key);
+                        it->second.second = items_.begin();
                     }
                     return it->second.first;
                 }
 
                 // Check secondary storage
-                auto it_sec = secondary_storage.find(key);
-                if (it_sec != secondary_storage.end()) {
+                auto it_sec = secondary_storage_.find(key);
+                if (it_sec != secondary_storage_.end()) {
                     if ((value = it_sec->second.lock())) {
                         // Move back to primary cache
-                        putInternal(key, value, true);
+                        put_internal(key, value, true);
                         return value;
                     }
                 }
 
                 // If a retrieval is already in progress for this key, wait
-                while (retrieving_keys.contains(key)) {
-                    retrieve_cond.wait(lock);
+                while (retrieving_keys_.contains(key)) {
+                    retrieve_cond_.wait(lock);
                 }
 
                 // Begin retrieving the value
-                retrieving_keys.insert(key);
+                retrieving_keys_.insert(key);
                 lock.unlock();
-
-                // Ensure notify_all is always called
-                NotifyGuard notifyGuard(retrieve_cond);
 
                 // Scope guard to ensure cleanup (act as a "finally" block)
                 finally cleanup([&] {
-                    retrieving_keys.erase(key);
+					// need the lock held, here, which it will be by dtor time.
+					// dtors are called in reverse order of construction
+                    retrieving_keys_.erase(key); // erase is noexcept.  Safe to call notify_all afterward
+                    retrieve_cond_.notify_all();
                     });
 
-            	// Retrieve the value outside the mutex
-                try {
-                    value = retrieveFunc(key);
+                // Retrieve the value outside the mutex
+                if constexpr (NoexceptRetrieveFunc<RetrieveFuncType, Key, Value>) {
+                    value = retrieve_func_(key);
                 }
-                catch (const std::exception& e) {
-                    // Handle the exception, e.g., log an error and return a default value
-                    std::cerr << "Error retrieving value: " << e.what() << std::endl;
-                    return std::nullopt;
+                else {
+                    try {
+                        value = retrieve_func_(key);
+                    }
+                    catch (const std::exception& e) {
+                        // Handle the exception, e.g., log an error and return a default value
+                        std::cerr << "Error retrieving value: " << e.what() << '\n';
+                        return std::nullopt;
+                    }
                 }
-                lock.lock();
+
+                // lock here and let the dtor unlock.
+                lock.lock(); 
                 if (value != nullptr) {
-                    putInternal(key, value, false);
+                    put_internal(key, value, false);
                     return value;
                 }
                 // Handle cache miss or error
                 return std::nullopt;
-
-                // REMINDER*********
-                // NotifyGuard and cleanup will be called on return because of RAII
             }
         }
 
-        size_t getThrashingMetrics() {
-            std::lock_guard<std::mutex> lock(mutex);
+        size_t get_thrashing_metrics() {
+            std::lock_guard<std::mutex> lock(mutex_);
             size_t evictions = 0;
-            for (const auto& evicted : thrashingMetrics) {
+            for (const auto evicted : thrashing_metrics_) {
                 if (evicted) {
                     evictions++;
                 }
@@ -156,84 +216,81 @@ namespace tnt {
         }
 
     private:
-        size_t maxRamUsageBytes;
-        size_t currentRamUsageBytes = 0;
-        size_t thrashingWindow;
-        size_t cleanUpThreshold;
-        size_t evictionCount = 0;
-        size_t requestCount = 0;
-        std::vector<bool> thrashingMetrics;
-        std::list<Key> items;
-        tbb::concurrent_unordered_map<Key, std::pair<std::shared_ptr<Value>, typename std::list<Key>::iterator>> cache;
-        tbb::concurrent_unordered_map<Key, std::weak_ptr<Value>> secondary_storage;
-        std::unordered_set<Key> retrieving_keys;
-        std::mutex mutex;
-        std::condition_variable retrieve_cond;
-        RetrieveFunc retrieveFunc;
+        size_t max_ram_usage_bytes_;
+        size_t current_ram_usage_bytes_ = 0;
+        size_t thrashing_window_;
+        size_t clean_up_threshold_;
+        size_t eviction_count_ = 0;
+        size_t request_count_ = 0;
+        std::vector<bool> thrashing_metrics_;
+        std::list<Key> items_;
+        tbb::concurrent_unordered_map<Key, std::pair<std::shared_ptr<Value>, typename std::list<Key>::iterator>> cache_;
+        tbb::concurrent_unordered_map<Key, std::weak_ptr<Value>> secondary_storage_;
+        std::unordered_set<Key> retrieving_keys_;
+        std::mutex mutex_;
+        std::condition_variable retrieve_cond_;
+        RetrieveFuncType retrieve_func_;
 
-        void putInternal(const Key key, std::shared_ptr<Value> value, bool fromSecondary) {
-            auto it = cache.find(key);
-            if (it != cache.end() && isValidIterator(it->second.second, items)) {
+        void put_internal(const Key key, std::shared_ptr<Value> value, const bool from_secondary) {
+            auto it = cache_.find(key);
+            bool eviction_occurred = false;
+
+            if (it != cache_.end() && isValidIterator(it->second.second, items_)) {
                 // Update the value and move to front
-                items.splice(items.begin(), items, it->second.second);
-                currentRamUsageBytes -= getSize(it->second.first);
+                items_.splice(items_.begin(), items_, it->second.second);
+                current_ram_usage_bytes_ -= get_size(it->second.first);
                 it->second.first = value;
-                currentRamUsageBytes += getSize(value);
+                current_ram_usage_bytes_ += get_size(value);
             }
             else {
                 // Handle new insertion or invalid iterator
-                if (it == cache.end()) {
-                    currentRamUsageBytes += getSize(value);
+                if (it == cache_.end()) {
+                    current_ram_usage_bytes_ += get_size(value);
                 }
                 else {
-                    currentRamUsageBytes -= getSize(it->second.first);
-                    currentRamUsageBytes += getSize(value);
+                    current_ram_usage_bytes_ -= get_size(it->second.first);
+                    current_ram_usage_bytes_ += get_size(value);
                 }
-
-                while (currentRamUsageBytes > maxRamUsageBytes && !items.empty()) {
+                while (current_ram_usage_bytes_ > max_ram_usage_bytes_ && !items_.empty()) {
                     // Evict the least recently used item
-                    const Key evicted_key = items.back();
-                    items.pop_back();
-                    auto evicted_item = cache.find(evicted_key);
+                    const Key evicted_key = items_.back();
+                    items_.pop_back();
+                    auto evicted_item = cache_.find(evicted_key);
 
-                    currentRamUsageBytes -= getSize(evicted_item->second.first);
+                    current_ram_usage_bytes_ -= get_size(evicted_item->second.first);
 
                     // Move to secondary storage
                     if (evicted_item->second.first.use_count() > 1) {
-                        secondary_storage[evicted_key] = evicted_item->second.first;
+                        secondary_storage_[evicted_key] = evicted_item->second.first;
                     }
-                    cache.unsafe_erase(evicted_key);
+                    cache_.unsafe_erase(evicted_key);
 
-                    evictionCount++;
-                    thrashingMetrics[requestCount % thrashingWindow] = true;
-                }
-                thrashingMetrics[requestCount % thrashingWindow] = false;
-                requestCount++;
-
-                if (evictionCount >= cleanUpThreshold) {
-                    cleanUpSecondary();
-                    evictionCount = 0;
+                    eviction_count_++;
+                    eviction_occurred = true;
                 }
 
-                if (!fromSecondary) {
-                    items.push_front(key);
+                if (eviction_count_ >= clean_up_threshold_) {
+                    clean_up_secondary();
+                    eviction_count_ = 0;
+                }
+
+                if (!from_secondary) {
+                    items_.push_front(key);
                 }
                 else {
-                    items.insert(items.begin(), key);
+                    items_.insert(items_.begin(), key);
                 }
 
-                cache[key] = { value, items.begin() };
+                cache_[key] = { value, items_.begin() };
             }
+            thrashing_metrics_[request_count_ % thrashing_window_] = eviction_occurred;
+            request_count_++;
         }
 
-        bool isValidIterator(const typename std::list<Key>::iterator& it, const std::list<Key>& lst) {
-            return it != lst.end();
-        }
-
-        void cleanUpSecondary() {
-            for (auto it = secondary_storage.begin(); it != secondary_storage.end();) {
+        void clean_up_secondary() {
+            for (auto it = secondary_storage_.begin(); it != secondary_storage_.end();) {
                 if (it->second.expired()) {
-                    it = secondary_storage.unsafe_erase(it);
+                    it = secondary_storage_.unsafe_erase(it);
                 }
                 else {
                     ++it;
@@ -241,14 +298,14 @@ namespace tnt {
             }
         }
 
-        class NotifyGuard {
+        class notify_guard {
         public:
-            NotifyGuard(std::condition_variable& cv) : cv(cv) {}
-            ~NotifyGuard() {
-                cv.notify_all();
+            notify_guard(std::condition_variable& cv) : cv_(cv) {}
+            ~notify_guard() {
+                cv_.notify_all();
             }
         private:
-            std::condition_variable& cv;
+            std::condition_variable& cv_;
         };
     };
 }
