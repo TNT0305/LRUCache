@@ -13,7 +13,7 @@ using namespace tnt::caching::gemini2; // If you are using a namespace
 
 struct TestValue {
     std::string data;
-    TestValue(const std::string& d) : data(d) {}
+    TestValue(const std::string& d) : data(d + std::string(1000 - d.length(), 'x')) {}
 };
 
 size_t get_size(const TestValue& tv) { // Correct signature
@@ -22,7 +22,7 @@ size_t get_size(const TestValue& tv) { // Correct signature
 
 int main() {
     constexpr size_t num_threads = 32;
-    constexpr size_t num_keys = 1000;
+    constexpr size_t num_keys = 100000;
     constexpr size_t num_iterations = 100000;
     constexpr size_t max_memory = 1024 * 1024;
 
@@ -59,7 +59,14 @@ int main() {
 
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    size_t reactivations = cache.get_reactivation_count();
+    size_t second_consumers = cache.get_second_consumer_count();
+    size_t evictions = cache.get_eviction_count();
 
+    std::cout << "Reactivations: " << reactivations << std::endl;
+    std::cout << "Second Consumers: " << second_consumers << std::endl;
+    std::cout << "Evictions: " << evictions << std::endl;
+    
     std::cout << "Test completed." << std::endl;
     std::cout << "Time taken: " << duration.count() << "ms" << std::endl;
     std::cout << "Total Fetches: " << fetches.load() << std::endl;

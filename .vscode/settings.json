@@ -91,6 +91,8 @@
         "set": "cpp",
         "variant": "cpp",
         "any": "cpp",
-        "cwctype": "cpp"
+        "cwctype": "cpp",
+        "bitset": "cpp",
+        "deque": "cpp"
     }
 }
