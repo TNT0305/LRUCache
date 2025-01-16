@@ -48,20 +48,31 @@ private:
 
     void evict_lru() {
         std::lock_guard<std::mutex> eviction_lock(eviction_mutex_);
-        std::lock_guard<std::mutex> combined_lock(combined_mutex_);
+        std::vector<K> keys_to_evict; // Collect keys to evict
 
-        if (lru_.empty()) return;
+        {
+            std::lock_guard<std::mutex> combined_lock(combined_mutex_);
+            if (lru_.empty()) return;
 
-        auto& back = lru_.back();
-        current_memory_.fetch_sub(back.size, std::memory_order_relaxed);
-        lru_memory_.fetch_sub(back.size, std::memory_order_relaxed);
+            while (current_memory_.load(std::memory_order_relaxed) > max_memory_) {
+                if (lru_.empty()) break;
+                auto& back = lru_.back();
+                keys_to_evict.push_back(back.key);
+                current_memory_.fetch_sub(back.size, std::memory_order_relaxed);
+                lru_memory_.fetch_sub(back.size, std::memory_order_relaxed);
+                lru_map_.erase(back.key);
+                lru_.pop_back();
+            }
+        } // Release combined_mutex_ here
 
-        value_map_.erase(back.key);
-
-        lru_map_.erase(back.key);
-        lru_.pop_back();
+        // Now erase from value_map_ outside the combined_mutex_
+        {
+            std::lock_guard<std::mutex> combined_lock(combined_mutex_);
+            for (const auto& key : keys_to_evict) {
+                value_map_.erase(key);
+            }
+        }
     }
-
     void remove_from_lru(const K& key, size_t value_size) {
         std::lock_guard<std::mutex> combined_lock(combined_mutex_);
         if (lru_map_.contains(key)) {
