@@ -96,17 +96,20 @@ public:
             }
             return nullptr;
         }
-        combined_lock.unlock(); // Release the lock BEFORE calling fetcher_
+
+        combined_lock.unlock();
 
         V* entry_ptr = nullptr;
 
         try {
-            V fetched_value = fetcher_(key); // Call fetcher_ WITHOUT holding the lock
+            V fetched_value = fetcher_(key);
             size_t value_size = sizeof(V);
+
             entry_ptr = new V(fetched_value);
 
             {
-                std::lock_guard<std::mutex> combined_lock_guard(combined_mutex_); // Reacquire the lock
+                std::lock_guard<std::mutex> combined_lock_guard(combined_mutex_);
+
                 entry->value = std::shared_ptr<V>(entry_ptr);
                 entry->key = key;
                 entry->size = value_size;
@@ -122,28 +125,33 @@ public:
             }
         } catch (...) {
             delete entry_ptr;
+            entry_ptr = nullptr; // Important to avoid double delete
             {
-                std::unique_lock<std::mutex> combined_lock_catch(combined_mutex_, std::adopt_lock);
-                typename tbb::concurrent_hash_map<K, std::shared_ptr<CacheEntry>>::accessor a;
-                if (this->value_map_.find(a, key)) {
-                    this->value_map_.erase(a);
+                std::lock_guard<std::mutex> combined_lock_guard(combined_mutex_);
+                // Corrected promise check
+                if (entry->promise.get_future().valid() && entry->promise.get_future().wait_for(std::chrono::nanoseconds(0)) != std::future_status::ready) {
+                    if (lru_map_.contains(key)) {
+                        current_memory_.fetch_sub(entry->size, std::memory_order_relaxed);
+                        lru_memory_.fetch_sub(entry->size, std::memory_order_relaxed);
+                        lru_.erase(lru_map_.at(key));
+                        lru_map_.erase(key);
+                    }
+                    value_map_.erase(key);
+                    entry->promise.set_exception(std::current_exception());
                 }
             }
-            entry->promise.set_exception(std::current_exception());
-            throw;
+            throw; // Re-throw the exception
         }
-
         {
             std::lock_guard<std::mutex> combined_lock(combined_mutex_);
-            if (lru_map_.contains(key)) {
-                current_memory_.fetch_sub(entry->size, std::memory_order_relaxed);
-                lru_memory_.fetch_sub(entry->size, std::memory_order_relaxed);
-                lru_.erase(lru_map_.at(key));
-                lru_map_.erase(key);
-            }
-            value_map_.erase(key);
+                if (lru_map_.contains(key)) {
+                    current_memory_.fetch_sub(entry->size, std::memory_order_relaxed);
+                    lru_memory_.fetch_sub(entry->size, std::memory_order_relaxed);
+                    lru_.erase(lru_map_.at(key));
+                    lru_map_.erase(key);
+                }
+                value_map_.erase(key);
         }
-
         return entry->value;
     }
     void clear() {
