@@ -8,6 +8,14 @@ set(CMAKE_CXX_STANDARD_REQUIRED True)
 if(MSVC)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /std:c++20 /permissive- /Zc:preprocessor /Zc:twoPhase-")
 endif()
+
+# Clang-cl specific flags
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wmost -fdiagnostics-show-template-tree")
+    # You could also try setting a specific MSVC compatibility version:
+    # set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fms-compatibility-version=19.34") # Replace 19.34 with your VS version if needed
+endif()
+
 message(STATUS "Build Type: ${CMAKE_BUILD_TYPE}")
 # Find and link TBB
 find_package(TBB CONFIG REQUIRED)
