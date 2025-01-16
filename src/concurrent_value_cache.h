@@ -96,20 +96,17 @@ public:
             }
             return nullptr;
         }
-
-        combined_lock.unlock();
+        combined_lock.unlock(); // Release the lock BEFORE calling fetcher_
 
         V* entry_ptr = nullptr;
 
         try {
-            V fetched_value = fetcher_(key);
+            V fetched_value = fetcher_(key); // Call fetcher_ WITHOUT holding the lock
             size_t value_size = sizeof(V);
-
             entry_ptr = new V(fetched_value);
 
             {
-                std::lock_guard<std::mutex> combined_lock_guard(combined_mutex_);
-
+                std::lock_guard<std::mutex> combined_lock_guard(combined_mutex_); // Reacquire the lock
                 entry->value = std::shared_ptr<V>(entry_ptr);
                 entry->key = key;
                 entry->size = value_size;
@@ -135,6 +132,7 @@ public:
             entry->promise.set_exception(std::current_exception());
             throw;
         }
+
         {
             std::lock_guard<std::mutex> combined_lock(combined_mutex_);
             if (lru_map_.contains(key)) {
@@ -148,7 +146,6 @@ public:
 
         return entry->value;
     }
-
     void clear() {
         std::lock_guard<std::mutex> combined_lock(combined_mutex_);
         value_map_.clear();
