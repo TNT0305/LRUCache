@@ -100,11 +100,11 @@ public:
         combined_lock.unlock();
 
         V* entry_ptr = nullptr;
+        bool exception_thrown = false;
 
         try {
             V fetched_value = fetcher_(key);
             size_t value_size = sizeof(V);
-
             entry_ptr = new V(fetched_value);
 
             {
@@ -125,35 +125,28 @@ public:
             }
         } catch (...) {
             delete entry_ptr;
-            entry_ptr = nullptr; // Important to avoid double delete
+            entry_ptr = nullptr;
             {
                 std::lock_guard<std::mutex> combined_lock_guard(combined_mutex_);
-                // Corrected promise check
-                if (entry->promise.get_future().valid() && entry->promise.get_future().wait_for(std::chrono::nanoseconds(0)) != std::future_status::ready) {
-                    if (lru_map_.contains(key)) {
-                        current_memory_.fetch_sub(entry->size, std::memory_order_relaxed);
-                        lru_memory_.fetch_sub(entry->size, std::memory_order_relaxed);
-                        lru_.erase(lru_map_.at(key));
-                        lru_map_.erase(key);
-                    }
-                    value_map_.erase(key);
-                    entry->promise.set_exception(std::current_exception());
-                }
+                entry->promise.set_exception(std::current_exception());
             }
-            throw; // Re-throw the exception
+            exception_thrown = true;
         }
+
         {
             std::lock_guard<std::mutex> combined_lock(combined_mutex_);
-                if (lru_map_.contains(key)) {
-                    current_memory_.fetch_sub(entry->size, std::memory_order_relaxed);
-                    lru_memory_.fetch_sub(entry->size, std::memory_order_relaxed);
-                    lru_.erase(lru_map_.at(key));
-                    lru_map_.erase(key);
-                }
-                value_map_.erase(key);
+            if (lru_map_.contains(key)) {
+                current_memory_.fetch_sub(entry->size, std::memory_order_relaxed);
+                lru_memory_.fetch_sub(entry->size, std::memory_order_relaxed);
+                lru_.erase(lru_map_.at(key));
+                lru_map_.erase(key);
+            }
+            value_map_.erase(key);
         }
+        if (exception_thrown) throw;
         return entry->value;
     }
+
     void clear() {
         std::lock_guard<std::mutex> combined_lock(combined_mutex_);
         value_map_.clear();
