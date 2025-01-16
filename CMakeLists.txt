@@ -12,7 +12,7 @@ find_package(GTest CONFIG REQUIRED)
 
 # Add test executable
 add_executable(${PROJECT_NAME}_test 
-    src/main.cpp
+    src/minimal_test.cpp
 )
 
 target_link_libraries(${PROJECT_NAME}_test 
@@ -21,7 +21,13 @@ target_link_libraries(${PROJECT_NAME}_test
         GTest::gtest 
         GTest::gtest_main
 )
-
+# Add custom target for preprocessor output
+add_custom_target(
+    preprocess_minimal
+    COMMAND ${CMAKE_CXX_COMPILER} -E ${CMAKE_CURRENT_SOURCE_DIR}/minimal_test.cpp > ${CMAKE_CURRENT_BINARY_DIR}/preprocessed.cpp
+    DEPENDS minimal_test # Optional: Make it depend on the executable
+    COMMENT "Generating preprocessed minimal_test.cpp"
+)
 # Enable testing
 enable_testing()
 add_test(NAME ${PROJECT_NAME}_test COMMAND ${PROJECT_NAME}_test)

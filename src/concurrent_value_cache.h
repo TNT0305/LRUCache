@@ -31,6 +31,7 @@ private:
         size_t size;
     };
 
+    // ValueDeleter is now a member type
     struct ValueDeleter {
         concurrent_value_cache* cache;
         K key;
@@ -137,4 +138,5 @@ public:
         return future.get();
     }
 };
-}; // tnt::caching::gemini2
+
+} // namespace tnt::caching::gemini2
