@@ -86,7 +86,9 @@ public:
     explicit concurrent_value_cache(Fetcher fetcher, size_t max_memory)
         : fetcher_(std::move(fetcher)), max_memory_(max_memory) {}
 
-
+    ~concurrent_value_cache() {
+        clear();
+    }
     std::shared_ptr<V> get(const K& key) {
         {
             std::shared_lock<std::shared_mutex> read_lock(map_mutex_);
@@ -134,6 +136,18 @@ public:
         }
 
         return future.get();
+    }
+
+    void clear() {
+        {
+            std::unique_lock<std::shared_mutex> write_lock(map_mutex_);
+            value_map_.clear();
+        }
+        {
+            std::lock_guard<std::mutex> lru_lock(lru_mutex_);
+            lru_.clear();
+            lru_map_.clear();
+        }
     }
 
     size_t get_lru_size() const {
