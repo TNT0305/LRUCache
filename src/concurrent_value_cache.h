@@ -34,11 +34,11 @@ private:
     size_t max_memory_;
     std::atomic<size_t> current_memory_{0};
     std::atomic<size_t> lru_memory_{0};
-    std::mutex cache_mutex_;        // Mutex for LRU and other cache metadata
-    std::mutex eviction_mutex_;     // Mutex for evictions
-    std::mutex map_mutex_;          // Mutex specifically for the TBB map
+    std::mutex cache_mutex_;
+    std::mutex eviction_mutex_;
+    std::mutex map_mutex_;
     std::atomic<bool> is_destroying_{false};
-    tbb::concurrent_hash_map<K, CacheEntry> value_map_;
+    tbb::concurrent_hash_map<K, std::shared_ptr<CacheEntry>> value_map_;
     std::list<LRUEntry> lru_;
     std::unordered_map<K, typename std::list<LRUEntry>::iterator> lru_map_;
     std::atomic<size_t> reactivation_count_{0};
@@ -86,54 +86,58 @@ public:
         : fetcher_(std::move(fetcher)), max_memory_(max_memory) {}
 
     std::shared_ptr<V> get(const K& key) {
+        std::shared_ptr<CacheEntry> entry;
         {
             std::lock_guard<std::mutex> map_lock(map_mutex_);
-            typename tbb::concurrent_hash_map<K, CacheEntry>::const_accessor a;
+            typename tbb::concurrent_hash_map<K, std::shared_ptr<CacheEntry>>::const_accessor a;
             if (value_map_.find(a, key)) {
                 reactivation_count_.fetch_add(1, std::memory_order_relaxed);
-                return a->second.value;
+                return a->second->value;
             }
         }
 
         std::lock_guard<std::mutex> cache_lock(cache_mutex_);
-        typename tbb::concurrent_hash_map<K, CacheEntry>::accessor a;
-        bool inserted = false;
+
         {
             std::lock_guard<std::mutex> map_lock(map_mutex_);
-            inserted = value_map_.insert(a, {key, CacheEntry{}});
+            typename tbb::concurrent_hash_map<K, std::shared_ptr<CacheEntry>>::accessor a;
+            bool inserted = false;
+            entry = std::make_shared<CacheEntry>();
+            inserted = value_map_.insert(std::make_pair(key, entry));
 
             if (!inserted) {
                 second_consumer_count_.fetch_add(1, std::memory_order_relaxed);
-                return a->second.value;
+
+                typename tbb::concurrent_hash_map<K, std::shared_ptr<CacheEntry>>::const_accessor a2;
+                if (value_map_.find(a2, key)) {
+                    return a2->second->value;
+                } else {
+                    map_lock.release();
+                    cache_lock.release();
+                    return get(key);
+                }
             }
         }
 
-        std::promise<std::shared_ptr<V>> promise;
-        auto future = promise.get_future();
-        a->second.promise = std::move(promise);
-
-        std::shared_ptr<V> value;
         try {
             V fetched_value = fetcher_(key);
             size_t value_size = sizeof(V);
 
-            value = std::shared_ptr<V>(new V(fetched_value), [this, key](V* ptr) {
+            entry->value = std::shared_ptr<V>(new V(fetched_value), [this, key](V* ptr) {
                 if (!this->is_destroying_.load(std::memory_order_acquire)) {
                     std::lock_guard<std::mutex> cache_lock(cache_mutex_);
                     {
                         std::lock_guard<std::mutex> map_lock(map_mutex_);
-                        typename tbb::concurrent_hash_map<K, CacheEntry>::accessor a;
-                        if (this->value_map_.find(a, key) && a->second.value.get() == ptr) {
-                            this->remove_from_lru(key, a->second.size);
-                            this->value_map_.erase(a);
+                        typename tbb::concurrent_hash_map<K, std::shared_ptr<CacheEntry>>::accessor a;
+                        if (this->value_map_.find(a, key) && a->second->value.get() == ptr) {
+                            this->remove_from_lru(key, a->second->size);
                         }
                     }
                 }
                 delete ptr;
             });
 
-            a->second.value = value;
-            a->second.size = value_size;
+            entry->size = value_size;
 
             lru_.push_front({key, value_size});
             lru_map_.insert_or_assign(key, lru_.begin());
@@ -142,21 +146,21 @@ public:
             while (current_memory_.load(std::memory_order_relaxed) > max_memory_) {
                 evict_lru();
             }
-            a->second.promise.set_value(value); // Moved this line down!
+            entry->promise.set_value(entry->value);
         } catch (...) {
-            if (inserted) {
+            {
                 std::lock_guard<std::mutex> map_lock(map_mutex_);
-                typename tbb::concurrent_hash_map<K, CacheEntry>::accessor a;
+                typename tbb::concurrent_hash_map<K, std::shared_ptr<CacheEntry>>::accessor a;
                 if (this->value_map_.find(a, key))
                 {
                     this->value_map_.erase(a);
                 }
             }
-            a->second.promise.set_exception(std::current_exception());
+            entry->promise.set_exception(std::current_exception());
             throw;
         }
 
-        return future.get();
+        return entry->value;
     }
 
     void clear() {
@@ -177,12 +181,4 @@ public:
 
     size_t get_reactivation_count() const { return reactivation_count_.load(std::memory_order_relaxed); }
     size_t get_second_consumer_count() const { return second_consumer_count_.load(std::memory_order_relaxed); }
-    size_t get_eviction_count() const { return eviction_count_.load(std::memory_order_relaxed); }
-
-    ~concurrent_value_cache() {
-        is_destroying_.store(true, std::memory_order_relaxed);
-        clear();
-    }
-};
-
-} // namespace tnt::caching::gemini2
+    size_t get_eviction_count() const { return eviction_count_.
