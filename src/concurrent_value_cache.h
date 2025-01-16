@@ -25,7 +25,6 @@ private:
         std::promise<std::shared_ptr<V>> promise;
         size_t size = 0;
         K key;
-        std::function<void()> cleanup_action; // NEW: Added cleanup action
     };
 
     struct LRUEntry {
@@ -57,8 +56,6 @@ private:
             lru_memory_.fetch_sub(back.size, std::memory_order_relaxed);
             lru_map_.erase(back.key);
             lru_.pop_back();
-
-            // REMOVED: value_map_.erase(back.key); // No longer needed
         }
     }
 
@@ -89,8 +86,8 @@ public:
             return a->second->value;
         }
 
-        auto entry = std::make_shared<CacheEntry>();
-        inserted = value_map_.insert(std::make_pair(key, entry));
+        std::unique_ptr<CacheEntry> entry(new CacheEntry());
+        inserted = value_map_.insert(std::make_pair(key, std::shared_ptr<CacheEntry>(entry.get())));
 
         if (!inserted) {
             combined_lock.unlock();
@@ -114,21 +111,8 @@ public:
             {
                 std::lock_guard<std::mutex> combined_lock_guard(combined_mutex_);
 
-                entry->cleanup_action = [this, key, value_size]() {
-                    std::lock_guard<std::mutex> combined_lock(combined_mutex_);
-                    if (lru_map_.contains(key)) {
-                        current_memory_.fetch_sub(value_size, std::memory_order_relaxed);
-                        lru_memory_.fetch_sub(value_size, std::memory_order_relaxed);
-                        lru_.erase(lru_map_.at(key));
-                        lru_map_.erase(key);
-                    }
-                    value_map_.erase(key); // Corrected erase call
-                };
+                entry->value = std::shared_ptr<V>(entry_ptr);
 
-                entry->value = std::shared_ptr<V>(entry_ptr, [entry](V* ptr){
-                    if(entry->cleanup_action) entry->cleanup_action();
-                    delete ptr;
-                });
                 entry->key = key;
                 entry->size = value_size;
 
@@ -153,7 +137,16 @@ public:
             entry->promise.set_exception(std::current_exception());
             throw;
         }
-
+        {
+            std::lock_guard<std::mutex> combined_lock(combined_mutex_);
+            if (lru_map_.contains(key)) {
+                current_memory_.fetch_sub(entry->size, std::memory_order_relaxed);
+                lru_memory_.fetch_sub(entry->size, std::memory_order_relaxed);
+                lru_.erase(lru_map_.at(key));
+                lru_map_.erase(key);
+            }
+            value_map_.erase(key);
+        }
         return entry->value;
     }
 
