@@ -75,7 +75,7 @@ private:
     size_t max_memory_;
     size_t current_memory_ = 0;
     std::shared_mutex map_mutex_;
-    std::mutex lru_mutex_;
+    mutable std::mutex lru_mutex_;
     std::unordered_map<K, CacheEntry> value_map_;
     std::list<LRUEntry> lru_;
     std::unordered_map<K, typename std::list<LRUEntry>::iterator> lru_map_;
@@ -86,8 +86,6 @@ public:
     explicit concurrent_value_cache(Fetcher fetcher, size_t max_memory)
         : fetcher_(std::move(fetcher)), max_memory_(max_memory) {}
 
-    template<typename Fetcher>
-    concurrent_value_cache(Fetcher fetcher, size_t max_memory) -> concurrent_value_cache<decltype(std::declval<Fetcher>()(std::declval<K>())), K>;
 
     std::shared_ptr<V> get(const K& key) {
         {
@@ -136,6 +134,11 @@ public:
         }
 
         return future.get();
+    }
+
+    size_t get_lru_size() const {
+        std::lock_guard<std::mutex> lru_lock(lru_mutex_); // Protect access with mutex
+        return lru_.size();
     }
 };
 

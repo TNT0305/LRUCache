@@ -65,7 +65,7 @@ int main() {
     std::cout << "Total Fetches: " << fetches.load() << std::endl;
     std::cout << "Expected Fetches (max): " << num_keys << std::endl;
     assert(fetches <= num_keys);
-    std::cout << "Cache size: " << cache.lru_.size() << std::endl;
+    std::cout << "Cache size: " << cache.get_lru_size() << std::endl;
 
     return 0;
 }
