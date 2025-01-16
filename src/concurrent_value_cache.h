@@ -20,11 +20,12 @@ concept fetcher = requires(F f, const K& k) {
 template<typename K, typename V>
 class concurrent_value_cache {
 private:
-    struct CacheEntry {
+   struct CacheEntry {
         std::shared_ptr<V> value;
         std::promise<std::shared_ptr<V>> promise;
         size_t size = 0;
         K key;
+        std::function<void()> cleanup_action; // NEW: Added cleanup action
     };
 
     struct LRUEntry {
@@ -46,35 +47,18 @@ private:
     std::atomic<size_t> eviction_count_{0};
 
     void evict_lru() {
-        std::vector<K> keys_to_evict;
+        std::lock_guard<std::mutex> combined_lock(combined_mutex_); // Lock LRU operations
 
-        { // Protect LRU operations
-            std::lock_guard<std::mutex> combined_lock(combined_mutex_);
+        while (current_memory_.load(std::memory_order_relaxed) > max_memory_) {
+            if (lru_.empty()) break;
+            auto& back = lru_.back();
 
-            while (current_memory_.load(std::memory_order_relaxed) > max_memory_) {
-                if (lru_.empty()) break;
-                auto& back = lru_.back();
-                keys_to_evict.push_back(back.key);
-                current_memory_.fetch_sub(back.size, std::memory_order_relaxed);
-                lru_memory_.fetch_sub(back.size, std::memory_order_relaxed);
-                lru_map_.erase(back.key);
-                lru_.pop_back();
-            }
-        } // Release combined_mutex_
+            current_memory_.fetch_sub(back.size, std::memory_order_relaxed);
+            lru_memory_.fetch_sub(back.size, std::memory_order_relaxed);
+            lru_map_.erase(back.key);
+            lru_.pop_back();
 
-        // Erase from value_map_ OUTSIDE the combined_mutex_!
-        for (const auto& key : keys_to_evict) {
-            typename tbb::concurrent_hash_map<K, std::shared_ptr<CacheEntry>>::accessor a;
-            value_map_.erase(key);
-        }
-    }
-    void remove_from_lru(const K& key, size_t value_size) {
-        std::lock_guard<std::mutex> combined_lock(combined_mutex_);
-        if (lru_map_.contains(key)) {
-            current_memory_.fetch_sub(value_size, std::memory_order_relaxed);
-            lru_memory_.fetch_sub(value_size, std::memory_order_relaxed);
-            lru_.erase(lru_map_.at(key));
-            lru_map_.erase(key);
+            // REMOVED: value_map_.erase(back.key); // No longer needed
         }
     }
 
@@ -119,7 +103,6 @@ public:
 
         combined_lock.unlock();
 
-        std::vector<K> evicted_keys;
         V* entry_ptr = nullptr;
 
         try {
@@ -128,10 +111,24 @@ public:
 
             entry_ptr = new V(fetched_value);
 
-            { // Scoped lock for LRU update
+            {
                 std::lock_guard<std::mutex> combined_lock_guard(combined_mutex_);
 
-                entry->value = std::shared_ptr<V>(entry_ptr);
+                entry->cleanup_action = [this, key, value_size]() {
+                    std::lock_guard<std::mutex> combined_lock(combined_mutex_);
+                    if (lru_map_.contains(key)) {
+                        current_memory_.fetch_sub(value_size, std::memory_order_relaxed);
+                        lru_memory_.fetch_sub(value_size, std::memory_order_relaxed);
+                        lru_.erase(lru_map_.at(key));
+                        lru_map_.erase(key);
+                    }
+                    value_map_.erase(key); // Corrected erase call
+                };
+
+                entry->value = std::shared_ptr<V>(entry_ptr, [entry](V* ptr){
+                    if(entry->cleanup_action) entry->cleanup_action();
+                    delete ptr;
+                });
                 entry->key = key;
                 entry->size = value_size;
 
@@ -140,22 +137,10 @@ public:
                 current_memory_.fetch_add(value_size, std::memory_order_relaxed);
                 lru_memory_.fetch_add(value_size, std::memory_order_relaxed);
                 while (current_memory_.load(std::memory_order_relaxed) > max_memory_) {
-                    K evicted_key;
-                    {
-                        if (lru_.empty()) break;
-                        auto& back = lru_.back();
-                        evicted_key = back.key;
-                        current_memory_.fetch_sub(back.size, std::memory_order_relaxed);
-                        lru_memory_.fetch_sub(back.size, std::memory_order_relaxed);
-                        lru_map_.erase(back.key);
-                        lru_.pop_back();
-                    }
-                    evicted_keys.push_back(evicted_key);
-                    eviction_count_.fetch_add(1, std::memory_order_relaxed);
+                    evict_lru();
                 }
                 entry->promise.set_value(entry->value);
             }
-
         } catch (...) {
             delete entry_ptr;
             {
@@ -169,13 +154,17 @@ public:
             throw;
         }
 
-        // Erase from value_map_ OUTSIDE the combined_mutex_!
-        for (const auto& k : evicted_keys) {
-            typename tbb::concurrent_hash_map<K, std::shared_ptr<CacheEntry>>::accessor a;
-            value_map_.erase(k);
-        }
-
         return entry->value;
+    }
+
+    void remove_from_lru(const K& key, size_t value_size) {
+        std::lock_guard<std::mutex> combined_lock(combined_mutex_);
+        if (lru_map_.contains(key)) {
+            current_memory_.fetch_sub(value_size, std::memory_order_relaxed);
+            lru_memory_.fetch_sub(value_size, std::memory_order_relaxed);
+            lru_.erase(lru_map_.at(key));
+            lru_map_.erase(key);
+        }
     }
 
     void clear() {
