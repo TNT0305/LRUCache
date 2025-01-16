@@ -37,7 +37,6 @@ private:
     std::atomic<size_t> current_memory_{0};
     std::atomic<size_t> lru_memory_{0};
     std::mutex combined_mutex_; // Single mutex for all shared data
-    std::mutex eviction_mutex_;
     std::atomic<bool> is_destroying_{false};
     tbb::concurrent_hash_map<K, std::shared_ptr<CacheEntry>> value_map_;
     std::list<LRUEntry> lru_;
@@ -47,12 +46,10 @@ private:
     std::atomic<size_t> eviction_count_{0};
 
     void evict_lru() {
-        std::lock_guard<std::mutex> eviction_lock(eviction_mutex_);
-        std::vector<K> keys_to_evict; // Collect keys to evict
+        std::vector<K> keys_to_evict;
 
         {
-            std::lock_guard<std::mutex> combined_lock(combined_mutex_);
-            if (lru_.empty()) return;
+            std::lock_guard<std::mutex> combined_lock(combined_mutex_); // Protect all LRU access
 
             while (current_memory_.load(std::memory_order_relaxed) > max_memory_) {
                 if (lru_.empty()) break;
@@ -63,9 +60,8 @@ private:
                 lru_map_.erase(back.key);
                 lru_.pop_back();
             }
-        } // Release combined_mutex_ here
+        } // Release combined_mutex_
 
-        // Now erase from value_map_ outside the combined_mutex_
         {
             std::lock_guard<std::mutex> combined_lock(combined_mutex_);
             for (const auto& key : keys_to_evict) {
@@ -89,7 +85,7 @@ public:
     explicit concurrent_value_cache(Fetcher fetcher, size_t max_memory)
         : fetcher_(std::move(fetcher)), max_memory_(max_memory) {}
 
-    std::shared_ptr<V> get(const K& key) {
+     std::shared_ptr<V> get(const K& key) {
         {
             std::lock_guard<std::mutex> combined_lock(combined_mutex_);
             typename tbb::concurrent_hash_map<K, std::shared_ptr<CacheEntry>>::const_accessor a;
@@ -119,7 +115,7 @@ public:
             if (value_map_.find(a2, key)) {
                 return a2->second->value;
             }
-            return nullptr; // Should not happen, but return null just in case.
+            return nullptr;
         }
 
         combined_lock.unlock();
@@ -147,7 +143,8 @@ public:
                 while (current_memory_.load(std::memory_order_relaxed) > max_memory_) {
                     K evicted_key;
                     {
-                        std::lock_guard<std::mutex> eviction_lock(eviction_mutex_);
+                        // Removed eviction_lock, using combined_lock
+                        // std::lock_guard<std::mutex> eviction_lock(eviction_mutex_);
                         if (lru_.empty()) break;
                         auto& back = lru_.back();
                         evicted_key = back.key;
