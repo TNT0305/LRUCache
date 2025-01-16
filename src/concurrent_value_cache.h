@@ -107,15 +107,7 @@ public:
 
             if (!inserted) {
                 second_consumer_count_.fetch_add(1, std::memory_order_relaxed);
-
-                typename tbb::concurrent_hash_map<K, std::shared_ptr<CacheEntry>>::const_accessor a2;
-                if (value_map_.find(a2, key)) {
-                    return a2->second->value;
-                } else {
-                    map_lock.release();
-                    cache_lock.release();
-                    return get(key);
-                }
+                return a->second->value;
             }
         }
 
@@ -181,4 +173,12 @@ public:
 
     size_t get_reactivation_count() const { return reactivation_count_.load(std::memory_order_relaxed); }
     size_t get_second_consumer_count() const { return second_consumer_count_.load(std::memory_order_relaxed); }
-    size_t get_eviction_count() const { return eviction_count_.
+    size_t get_eviction_count() const { return eviction_count_.load(std::memory_order_relaxed); }
+
+    ~concurrent_value_cache() {
+        is_destroying_.store(true, std::memory_order_relaxed);
+        clear();
+    }
+};
+
+} // namespace tnt::caching::gemini2
