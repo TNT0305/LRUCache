@@ -48,8 +48,8 @@ private:
     void evict_lru() {
         std::vector<K> keys_to_evict;
 
-        {
-            std::lock_guard<std::mutex> combined_lock(combined_mutex_); // Protect all LRU access
+        { // Protect LRU operations
+            std::lock_guard<std::mutex> combined_lock(combined_mutex_);
 
             while (current_memory_.load(std::memory_order_relaxed) > max_memory_) {
                 if (lru_.empty()) break;
@@ -62,11 +62,10 @@ private:
             }
         } // Release combined_mutex_
 
-        {
-            std::lock_guard<std::mutex> combined_lock(combined_mutex_);
-            for (const auto& key : keys_to_evict) {
-                value_map_.erase(key);
-            }
+        // Erase from value_map_ OUTSIDE the combined_mutex_!
+        for (const auto& key : keys_to_evict) {
+            typename tbb::concurrent_hash_map<K, std::shared_ptr<CacheEntry>>::accessor a;
+            value_map_.erase(key);
         }
     }
     void remove_from_lru(const K& key, size_t value_size) {
@@ -85,7 +84,7 @@ public:
     explicit concurrent_value_cache(Fetcher fetcher, size_t max_memory)
         : fetcher_(std::move(fetcher)), max_memory_(max_memory) {}
 
-     std::shared_ptr<V> get(const K& key) {
+    std::shared_ptr<V> get(const K& key) {
         {
             std::lock_guard<std::mutex> combined_lock(combined_mutex_);
             typename tbb::concurrent_hash_map<K, std::shared_ptr<CacheEntry>>::const_accessor a;
@@ -115,7 +114,7 @@ public:
             if (value_map_.find(a2, key)) {
                 return a2->second->value;
             }
-            return nullptr;
+            return nullptr; // Should not happen, but return null just in case.
         }
 
         combined_lock.unlock();
@@ -143,8 +142,6 @@ public:
                 while (current_memory_.load(std::memory_order_relaxed) > max_memory_) {
                     K evicted_key;
                     {
-                        // Removed eviction_lock, using combined_lock
-                        // std::lock_guard<std::mutex> eviction_lock(eviction_mutex_);
                         if (lru_.empty()) break;
                         auto& back = lru_.back();
                         evicted_key = back.key;
@@ -171,12 +168,11 @@ public:
             entry->promise.set_exception(std::current_exception());
             throw;
         }
-        {
-            std::lock_guard<std::mutex> combined_lock(combined_mutex_);
-            for(const auto& k : evicted_keys)
-            {
-                value_map_.erase(k);
-            }
+
+        // Erase from value_map_ OUTSIDE the combined_mutex_!
+        for (const auto& k : evicted_keys) {
+            typename tbb::concurrent_hash_map<K, std::shared_ptr<CacheEntry>>::accessor a;
+            value_map_.erase(k);
         }
 
         return entry->value;
