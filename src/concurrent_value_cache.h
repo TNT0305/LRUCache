@@ -37,22 +37,23 @@ private:
         K key;
 
         void operator()(V* ptr) const {
-            if (cache) {
+            if (cache && !cache->is_destroying_.load(std::memory_order_acquire)) { // Check the flag!
                 {
                     std::unique_lock<std::shared_mutex> write_lock(cache->map_mutex_);
                     auto it = cache->value_map_.find(key);
                     if (it != cache->value_map_.end() && it->second.value.get() == ptr) {
                         std::lock_guard<std::mutex> lru_lock(cache->lru_mutex_);
-                        cache->lru_.push_front({key, 0});
-                        cache->lru_map_[key] = cache->lru_.begin();
-                        cache->current_memory_ += 0;
-                        while (cache->current_memory_ > cache->max_memory_) {
-                            cache->evict_lru();
+                        if (cache->lru_map_.contains(key))
+                        {
+                            cache->current_memory_ -= cache->lru_map_[key]->size;
+                            cache->lru_.erase(cache->lru_map_[key]);
+                            cache->lru_map_.erase(key);
                         }
                         cache->value_map_.erase(it);
                     }
                 }
             }
+            delete ptr; // Important: delete the pointer here!
         }
     };
 
@@ -76,6 +77,7 @@ private:
     size_t current_memory_ = 0;
     std::shared_mutex map_mutex_;
     mutable std::mutex lru_mutex_;
+    std::atomic<bool> is_destroying_{false}; // Add this flag
     std::unordered_map<K, CacheEntry> value_map_;
     std::list<LRUEntry> lru_;
     std::unordered_map<K, typename std::list<LRUEntry>::iterator> lru_map_;
@@ -87,6 +89,7 @@ public:
         : fetcher_(std::move(fetcher)), max_memory_(max_memory) {}
 
     ~concurrent_value_cache() {
+        is_destroying_.store(true, std::memory_order_relaxed); // Set the flag
         clear();
     }
     std::shared_ptr<V> get(const K& key) {
