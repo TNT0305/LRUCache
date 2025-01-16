@@ -2,10 +2,10 @@
   "version": 3,
   "cmakeMinimumRequired": {
     "major": 3,
-    "minor": 21,
-    "patch": 0
+    "minor": 22,
+    "patch": 2
   },
-  "presets": [
+  "configurePresets": [
     {
       "name": "default",
       "hidden": true,
@@ -16,17 +16,42 @@
       }
     },
     {
-      "name": "windows",
+      "name": "windows-Debug",
       "inherits": "default",
       "description": "Configure for Windows with Clang and vcpkg",
       "toolchainFile": "C:/vcpkg/scripts/buildsystems/vcpkg.cmake",
       "architecture": {
-        "value": "x64"
+        "value": "x64",
+        "strategy": "external"
       },
       "generator": "Ninja",
       "cacheVariables": {
         "CMAKE_C_COMPILER": "clang-cl",
-        "CMAKE_CXX_COMPILER": "clang-cl"
+        "CMAKE_CXX_COMPILER": "clang-cl",
+        "CMAKE_BUILD_TYPE": "Debug"
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      }
+    },
+    {
+      "name": "windows-Release",
+      "inherits": "windows-Debug",
+      "description": "Configure for Windows with Clang and vcpkg in RelWithDebInfo mode",
+      "hidden": false,
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    },
+    {
+      "name": "windows-RelWithDebInfo",
+      "inherits": "windows-Debug",
+      "description": "Configure for Windows with Clang and vcpkg in RelWithDebInfo mode",
+      "hidden": false,
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo"
       }
     },
     {
@@ -38,6 +63,11 @@
       "cacheVariables": {
         "CMAKE_C_COMPILER": "clang",
         "CMAKE_CXX_COMPILER": "clang++"
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Linux"
       }
     }
   ]

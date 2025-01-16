@@ -1,15 +1,7 @@
 cmake_minimum_required(VERSION 3.21)
-project(LRUCacheExample)
-
-# Specify C++ standard
+project(MinimalTest)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED True)
-
-# Find and link TBB
-find_package(TBB REQUIRED)
-
-# Specify the source files
-add_executable(LRUCacheExample src/main.cpp "src/lru_cache.h" )
-
-# Link TBB
-target_link_libraries(LRUCacheExample PRIVATE TBB::tbb)
+find_package(TBB CONFIG REQUIRED)
+add_executable(minimal_test minimal_test.cpp)
+target_link_libraries(minimal_test PRIVATE TBB::tbb)
