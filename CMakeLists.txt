@@ -1,7 +1,27 @@
 cmake_minimum_required(VERSION 3.21)
-project(MinimalTest)
+project(LRUCacheExample)
+
+# Specify C++ standard
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED True)
+
+message(STATUS "Build Type: ${CMAKE_BUILD_TYPE}")
+# Find and link TBB
 find_package(TBB CONFIG REQUIRED)
-add_executable(minimal_test minimal_test.cpp)
-target_link_libraries(minimal_test PRIVATE TBB::tbb)
+find_package(GTest CONFIG REQUIRED)
+
+# Add test executable
+add_executable(${PROJECT_NAME}_test 
+    src/main.cpp
+)
+
+target_link_libraries(${PROJECT_NAME}_test 
+    PRIVATE 
+        TBB::tbb
+        GTest::gtest 
+        GTest::gtest_main
+)
+
+# Enable testing
+enable_testing()
+add_test(NAME ${PROJECT_NAME}_test COMMAND ${PROJECT_NAME}_test)

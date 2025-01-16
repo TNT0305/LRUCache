@@ -18,34 +18,6 @@ concept fetcher = requires(F f, const K& k) {
 };
 
 template<typename K, typename V>
-class concurrent_value_cache; // Forward declaration
-
-template<typename K, typename V>
-struct ValueDeleter {
-    concurrent_value_cache<K, V>* cache;
-    K key;
-
-    void operator()(V* ptr) const {
-        if (cache) {
-            {
-                std::unique_lock<std::shared_mutex> write_lock(cache->map_mutex_);
-                auto it = cache->value_map_.find(key);
-                if (it != cache->value_map_.end() && it->second.value.get() == ptr) {
-                    std::lock_guard<std::mutex> lru_lock(cache->lru_mutex_);
-                    cache->lru_.push_front({key, 0});
-                    cache->lru_map_[key] = cache->lru_.begin();
-                    cache->current_memory_ += 0;
-                    while (cache->current_memory_ > cache->max_memory_) {
-                        cache->evict_lru();
-                    }
-                    cache->value_map_.erase(it);
-                }
-            }
-        }
-    }
-};
-
-template<typename K, typename V>
 class concurrent_value_cache {
 private:
     struct CacheEntry {
@@ -57,6 +29,30 @@ private:
     struct LRUEntry {
         K key;
         size_t size;
+    };
+
+    struct ValueDeleter {
+        concurrent_value_cache* cache;
+        K key;
+
+        void operator()(V* ptr) const {
+            if (cache) {
+                {
+                    std::unique_lock<std::shared_mutex> write_lock(cache->map_mutex_);
+                    auto it = cache->value_map_.find(key);
+                    if (it != cache->value_map_.end() && it->second.value.get() == ptr) {
+                        std::lock_guard<std::mutex> lru_lock(cache->lru_mutex_);
+                        cache->lru_.push_front({key, 0});
+                        cache->lru_map_[key] = cache->lru_.begin();
+                        cache->current_memory_ += 0;
+                        while (cache->current_memory_ > cache->max_memory_) {
+                            cache->evict_lru();
+                        }
+                        cache->value_map_.erase(it);
+                    }
+                }
+            }
+        }
     };
 
     void evict_lru() {
@@ -116,7 +112,7 @@ public:
         std::shared_ptr<V> value;
         try {
             V fetched_value = fetcher_(key);
-            value = std::shared_ptr<V>(new V(fetched_value), ValueDeleter<K, V>{this, key});
+            value = std::shared_ptr<V>(new V(fetched_value), ValueDeleter{this, key});
             {
                 std::unique_lock<std::shared_mutex> write_lock2(map_mutex_);
                 it->second.value = value;
