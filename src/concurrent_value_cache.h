@@ -169,7 +169,7 @@ public:
 
         accessor.release();
 
-        if (!local_promise) { // Another thread is fetching
+        if (!local_promise) {
             return shared_future.get();
         }
 
@@ -178,14 +178,19 @@ public:
             value_ptr = fetch_and_insert(key); // Fetch and insert
 
             { // Lock combined_mutex_ for setting the promise value
-                std::lock_guard<std::mutex> lock(combined_mutex_);
-                local_promise->set_value(value_ptr); // Set the value *inside* combined_mutex_
+                std::unique_lock<std::mutex> lock(combined_mutex_); // Use unique_lock
+                if (entry.promise == local_promise) { // Double-check before setting
+                    local_promise->set_value(value_ptr); // Set the value *inside* combined_mutex_
+                }
             }
             entry.is_fetching = false;
 
         } catch (...) {
             try {
-                local_promise->set_exception(std::current_exception()); // Set exception *inside* combined_mutex_
+                std::unique_lock<std::mutex> lock(combined_mutex_); // Use unique_lock
+                if (entry.promise == local_promise) {
+                    local_promise->set_exception(std::current_exception()); // Set exception *inside* combined_mutex_
+                }
             } catch (const std::future_error& e) {
                 if (e.code() != std::future_errc::promise_already_satisfied) {
                     std::cerr << "Unexpected future_error setting exception: " << e.what() << std::endl;
