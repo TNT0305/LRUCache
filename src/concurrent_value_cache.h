@@ -148,7 +148,7 @@ public:
 
         auto& entry = accessor->second;
         std::shared_ptr<std::promise<std::shared_ptr<V>>> local_promise;
-
+        std::shared_future<std::shared_ptr<V>> shared_future;
 
         {
             std::unique_lock<std::mutex> lock(entry.mutex);
@@ -160,26 +160,37 @@ public:
             if (!entry.is_fetching) {
                 entry.is_fetching = true;
                 local_promise = entry.promise = std::make_shared<std::promise<std::shared_ptr<V>>>();
-                entry.shared_future = local_promise->get_future().share(); // Initialize shared_future
+                entry.shared_future = local_promise->get_future().share();
             } else {
                 local_promise = entry.promise;
+                shared_future = entry.shared_future;
             }
         } // Release entry.mutex lock
 
-        std::shared_future<std::shared_ptr<V>> shared_future = entry.shared_future; // Retrieve shared future
         accessor.release();
 
-        if (!local_promise) {
+        if (!local_promise) { // Another thread is fetching
             return shared_future.get();
         }
 
         std::shared_ptr<V> value_ptr;
         try {
-            value_ptr = fetch_and_insert(key);
-            local_promise->set_value(value_ptr);
+            value_ptr = fetch_and_insert(key); // Fetch and insert
+
+            { // Lock combined_mutex_ for setting the promise value
+                std::lock_guard<std::mutex> lock(combined_mutex_);
+                local_promise->set_value(value_ptr); // Set the value *inside* combined_mutex_
+            }
             entry.is_fetching = false;
+
         } catch (...) {
-            local_promise->set_exception(std::current_exception());
+            try {
+                local_promise->set_exception(std::current_exception()); // Set exception *inside* combined_mutex_
+            } catch (const std::future_error& e) {
+                if (e.code() != std::future_errc::promise_already_satisfied) {
+                    std::cerr << "Unexpected future_error setting exception: " << e.what() << std::endl;
+                }
+            }
             entry.is_fetching = false;
             throw;
         }
