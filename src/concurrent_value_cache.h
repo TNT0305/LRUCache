@@ -29,8 +29,8 @@ private:
         size_t size = 0;
         K key;
         mutable std::mutex mutex;
+        std::shared_future<std::shared_ptr<V>> shared_future; // Correctly added here
     };
-
     struct LRUEntry {
         K key;
         size_t size;
@@ -136,23 +136,22 @@ public:
     std::shared_ptr<V> get(const K& key) {
         typename cache_type::accessor accessor;
 
-        // First, a non-locking check to avoid unnecessary locking if value is present
         if (cache_.find(accessor, key)) {
             auto& entry = accessor->second;
             if (entry.value) {
                 accessor.release();
                 return entry.value;
             }
-        }
-        else {
+        } else {
             cache_.insert(accessor, key);
         }
 
         auto& entry = accessor->second;
         std::shared_ptr<std::promise<std::shared_ptr<V>>> local_promise;
 
+
         {
-            std::unique_lock<std::mutex> lock(entry.mutex); // Lock per entry
+            std::unique_lock<std::mutex> lock(entry.mutex);
             if (entry.value) {
                 accessor.release();
                 return entry.value;
@@ -161,12 +160,13 @@ public:
             if (!entry.is_fetching) {
                 entry.is_fetching = true;
                 local_promise = entry.promise = std::make_shared<std::promise<std::shared_ptr<V>>>();
+                entry.shared_future = local_promise->get_future().share(); // Initialize shared_future
             } else {
                 local_promise = entry.promise;
             }
         } // Release entry.mutex lock
 
-        std::shared_future<std::shared_ptr<V>> shared_future = local_promise->get_future().share();
+        std::shared_future<std::shared_ptr<V>> shared_future = entry.shared_future; // Retrieve shared future
         accessor.release();
 
         if (!local_promise) {
@@ -175,7 +175,6 @@ public:
 
         std::shared_ptr<V> value_ptr;
         try {
-            // CRITICAL CHANGE: Fetch and insert in a *separate* function
             value_ptr = fetch_and_insert(key);
             local_promise->set_value(value_ptr);
             entry.is_fetching = false;
