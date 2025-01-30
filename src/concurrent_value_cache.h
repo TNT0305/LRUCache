@@ -135,21 +135,24 @@ public:
     // } 
     std::shared_ptr<V> get(const K& key) {
         typename cache_type::accessor accessor;
+
+        // First, a non-locking check to avoid unnecessary locking if value is present
         if (cache_.find(accessor, key)) {
             auto& entry = accessor->second;
             if (entry.value) {
                 accessor.release();
                 return entry.value;
             }
-        } else {
+        }
+        else {
             cache_.insert(accessor, key);
         }
 
         auto& entry = accessor->second;
-
         std::shared_ptr<std::promise<std::shared_ptr<V>>> local_promise;
+
         {
-            std::unique_lock<std::mutex> lock(entry.mutex);
+            std::unique_lock<std::mutex> lock(entry.mutex); // Lock per entry
             if (entry.value) {
                 accessor.release();
                 return entry.value;
@@ -161,7 +164,7 @@ public:
             } else {
                 local_promise = entry.promise;
             }
-        }
+        } // Release entry.mutex lock
 
         std::shared_future<std::shared_ptr<V>> shared_future = local_promise->get_future().share();
         accessor.release();
@@ -172,40 +175,44 @@ public:
 
         std::shared_ptr<V> value_ptr;
         try {
-            // CRITICAL CHANGE: Fetch *outside* of any locks related to this entry
-            V fetched_value = fetcher_(key);  // Fetch outside the lock
-            size_t value_size = sizeof(V);
-            value_ptr = std::make_shared<V>(fetched_value);
-
-            {
-                std::lock_guard<std::mutex> lock(combined_mutex_); // Lock for LRU and memory
-                typename cache_type::accessor write_accessor;
-                cache_.find(write_accessor, key);
-                auto& entry = write_accessor->second;
-
-                entry.value = value_ptr;
-                entry.key = key;
-                entry.size = value_size;
-
-                lru_.push_front({key, value_size});
-                lru_map_.insert_or_assign(key, lru_.begin());
-                current_memory_.fetch_add(value_size, std::memory_order_relaxed);
-                lru_memory_.fetch_add(value_size, std::memory_order_relaxed);
-
-                while (current_memory_.load(std::memory_order_relaxed) > max_memory_) {
-                    evict_lru();
-                }
-            }
-
+            // CRITICAL CHANGE: Fetch and insert in a *separate* function
+            value_ptr = fetch_and_insert(key);
             local_promise->set_value(value_ptr);
-            entry.is_fetching = false; // Reset the flag AFTER setting the value.
-
+            entry.is_fetching = false;
         } catch (...) {
             local_promise->set_exception(std::current_exception());
-            entry.is_fetching = false; // Ensure flag is reset even on exception.
+            entry.is_fetching = false;
             throw;
         }
         return shared_future.get();
+    }
+
+    // New helper function to perform the fetch and insertion
+    std::shared_ptr<V> fetch_and_insert(const K& key) {
+        V fetched_value = fetcher_(key); // Fetch value
+        size_t value_size = sizeof(V);
+        std::shared_ptr<V> value_ptr = std::make_shared<V>(fetched_value); // Create shared_ptr
+
+        {
+            std::lock_guard<std::mutex> lock(combined_mutex_); // Lock for LRU and memory
+            typename cache_type::accessor write_accessor;
+            cache_.find(write_accessor, key);
+            auto& entry = write_accessor->second;
+
+            entry.value = value_ptr;
+            entry.key = key;
+            entry.size = value_size;
+
+            lru_.push_front({key, value_size});
+            lru_map_.insert_or_assign(key, lru_.begin());
+            current_memory_.fetch_add(value_size, std::memory_order_relaxed);
+            lru_memory_.fetch_add(value_size, std::memory_order_relaxed);
+
+            while (current_memory_.load(std::memory_order_relaxed) > max_memory_) {
+                evict_lru();
+            }
+        } // Release combined_mutex_ lock
+        return value_ptr;
     }    
     void clear() {
         std::lock_guard<std::mutex> lock(combined_mutex_);
