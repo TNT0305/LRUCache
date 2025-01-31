@@ -1,5 +1,6 @@
 #pragma once
 
+#include <iostream>
 #include <atomic>
 #include <functional>
 #include <memory>
@@ -39,6 +40,13 @@ namespace tnt::caching::gemini2 {
     template <typename T>
         requires HasCapacity<T>
     constexpr size_t get_size(const std::shared_ptr<T>& value) noexcept {
+        return get_size(*value);
+    }
+
+    // For std::shared_ptr<T>, when T has capacity()
+    template <typename T>
+        requires HasCapacity<T>
+    constexpr size_t get_size(const std::unique_ptr<T>& value) noexcept {
         return get_size(*value);
     }
 
@@ -139,7 +147,6 @@ namespace tnt::caching::gemini2 {
                 if (active_cache_.find(accessor, key)) {
                     if (auto sp = accessor->second.lock()) {
                         second_consumer_count_.fetch_add(1);
-                        touch_lru(key);
                         return sp;
                     }
                 }
@@ -191,8 +198,6 @@ namespace tnt::caching::gemini2 {
                         // No change to current_memory_ since active items are not tracked
                     }
 
-                    touch_lru(key);
-
                     // Fulfill the promise with the fetched value
                     fetch_promise->set_value(sp);
                 }
@@ -239,6 +244,7 @@ namespace tnt::caching::gemini2 {
                     up = std::move(accessor->second);
                     inactive_cache_.erase(accessor);
                     current_memory_.fetch_sub(get_size(*up), std::memory_order_relaxed);
+                    reactivation_count_.fetch_add(1);
                 }
             }
 
@@ -254,8 +260,6 @@ namespace tnt::caching::gemini2 {
                 accessor->second = sp;
                 // No change to current_memory_ since active items are not tracked
             }
-            reactivation_count_.fetch_add(1);
-            touch_lru(key);
             return sp;
         }
 
@@ -270,6 +274,9 @@ namespace tnt::caching::gemini2 {
                 current_memory_.fetch_add(value_size, std::memory_order_relaxed);
             }
 
+            // Add to LRU queue
+            lru_queue_.enqueue(key);
+
             // Remove from active cache
             {
                 CacheMap::accessor accessor;
@@ -280,22 +287,20 @@ namespace tnt::caching::gemini2 {
             enforce_memory_limit();
         }
 
-        // Update LRU list
-        void touch_lru(const K& key) {
-            lru_queue_.enqueue(key);
-        }
-
         // Enforce memory limit by evicting least recently used items from inactive cache
         void enforce_memory_limit() {
             while (current_memory_.load(std::memory_order_relaxed) > max_memory_) {
                 K least_used_key;
                 if (!lru_queue_.try_dequeue(least_used_key)) {
+					auto sz = current_memory_.load(std::memory_order_relaxed);
+                    auto cache_sz = inactive_cache_.size();
+					std::cout << "Memory limit exceeded: " << sz << " > " << max_memory_ << ", " << cache_sz << std::endl;
                     break;
                 }
-                eviction_count_.fetch_add(1);
                 {
                     InactiveCacheMap::accessor accessor;
                     if (inactive_cache_.find(accessor, least_used_key)) {
+                        eviction_count_.fetch_add(1);
                         current_memory_.fetch_sub(get_size(*accessor->second), std::memory_order_relaxed);
                         inactive_cache_.erase(accessor);
                     }
@@ -315,3 +320,4 @@ namespace tnt::caching::gemini2 {
     }
 
 } // namespace tnt::caching::gemini2
+

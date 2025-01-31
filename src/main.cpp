@@ -23,12 +23,13 @@ int main() {
     constexpr size_t num_threads = 32;
     constexpr size_t num_keys = 100000;
     constexpr size_t num_iterations = 100000;
-    constexpr size_t max_memory = 1024 * 1024;
+    //constexpr size_t max_memory = 1024 * 1024; 
+    constexpr size_t max_memory = 1024 * 1024 * 10; // Increase cache size to 10 MB
 
-    std::atomic<size_t> fetches{0};
+    std::atomic<size_t> fetches{ 0 };
     auto cache = concurrent_value_cache<std::string, TestValue>(
         [&fetches](const std::string& key) {
-            fetches++;
+            ++fetches;
             return TestValue(key + "_value");
         }, max_memory
     );
@@ -49,7 +50,7 @@ int main() {
                 auto d = key + "_value";
                 assert(val->data == d + std::string(1000 - d.length(), 'x'));
             }
-        });
+            });
     }
 
     for (auto& thread : threads) {
@@ -65,7 +66,7 @@ int main() {
     std::cout << "Reactivations: " << reactivations << std::endl;
     std::cout << "Second Consumers: " << second_consumers << std::endl;
     std::cout << "Evictions: " << evictions << std::endl;
-    
+
     std::cout << "Test completed." << std::endl;
     std::cout << "Time taken: " << duration.count() << "ms" << std::endl;
     std::cout << "Actual Fetches: " << fetches.load() << std::endl;
@@ -78,18 +79,6 @@ int main() {
 
     return 0;
 }
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 // #include "caching_factory.h"
