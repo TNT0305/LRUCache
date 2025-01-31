@@ -2,253 +2,323 @@
 
 #include <atomic>
 #include <functional>
-#include <future>
-#include <list>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
-#include <concepts>
-#include <iostream>
 #include <tbb/concurrent_hash_map.h>
-#include <vector>
+#include <tbb/concurrent_queue.h>
+#include <list>
+#include <future>
 
 namespace tnt::caching::gemini2 {
+    // Helper function to calculate the size of a value
 
-template<typename F, typename K, typename V>
-concept fetcher = requires(F f, const K& k) {
-    { f(k) } -> std::same_as<V>;
-};
-
-template<typename K, typename V>
-class concurrent_value_cache {
-private:
-    struct CacheEntry {
-        std::shared_ptr<V> value;
-        std::shared_ptr<std::promise<std::shared_ptr<V>>> promise;
-        std::atomic<bool> is_fetching{false};
-        size_t size = 0;
-        K key;
-        mutable std::mutex mutex;
-        std::shared_future<std::shared_ptr<V>> shared_future; // Correctly added here
-    };
-    struct LRUEntry {
-        K key;
-        size_t size;
+    // Define the HasCapacity concept with noexcept requirement
+    template <typename T>
+    concept HasCapacity = requires(const T & value) {
+        { value.capacity() } noexcept -> std::convertible_to<size_t>;
     };
 
-    using lru_iterator = typename std::list<LRUEntry>::iterator;
-    using cache_type = tbb::concurrent_hash_map<K, CacheEntry>;
+    // Define the HasSize concept with noexcept requirement
+    template <typename T>
+    concept HasSize = requires(const T & value) {
+        { value.size() } noexcept -> std::convertible_to<size_t>;
+    };
 
-    std::function<V(const K&)> fetcher_;
-    size_t max_memory_;
-    std::atomic<size_t> current_memory_{0};
-    std::atomic<size_t> lru_memory_{0};
-    std::atomic<size_t> reactivation_count_{0};
-    std::atomic<size_t> second_consumer_count_{0};
-    std::atomic<size_t> eviction_count_{0};
+    // Helper function to calculate the size of a value
 
-    cache_type cache_;
-    std::list<LRUEntry> lru_;
-    std::unordered_map<K, lru_iterator> lru_map_;
-    mutable std::mutex combined_mutex_;
-
-    void evict_lru() {
-        std::lock_guard<std::mutex> lock(combined_mutex_);
-        if (lru_.empty()) return;
-
-        auto last = lru_.back();
-        typename cache_type::accessor accessor;
-        if (cache_.find(accessor, last.key)) {
-            current_memory_.fetch_sub(last.size, std::memory_order_relaxed);
-            lru_memory_.fetch_sub(last.size, std::memory_order_relaxed);
-            cache_.erase(accessor);
-            eviction_count_.fetch_add(1, std::memory_order_relaxed);
-        }
-        lru_map_.erase(last.key);
-        lru_.pop_back();
+    // Primary template: for types with capacity()
+    template <typename T>
+        requires HasCapacity<T>
+    constexpr size_t get_size(const T& value) noexcept {
+        return sizeof(T) + value.capacity() * sizeof(typename T::value_type);
     }
 
-public:
-    concurrent_value_cache(std::function<V(const K&)> fetcher, size_t max_memory)
-        : fetcher_(std::move(fetcher))
-        , max_memory_(max_memory) {}
-
-    // std::shared_ptr<V> get(const K& key) {
-    //     typename cache_type::accessor accessor;
-    //     cache_.insert(accessor, key);
-    //     auto& entry = accessor->second;
-
-    //     if (entry.value) {
-    //         accessor.release();
-    //         return entry.value;
-    //     }
-
-    //     bool expected = false;
-    //     if (!entry.is_fetching.compare_exchange_strong(expected, true)) {
-    //         second_consumer_count_.fetch_add(1, std::memory_order_relaxed);
-    //         auto future = entry.promise->get_future();
-    //         accessor.release();
-    //         return future.get();
-    //     }
-
-    //     entry.promise = std::make_shared<std::promise<std::shared_ptr<V>>>();
-    //     accessor.release();
-
-    //     V* entry_ptr = nullptr;
-    //     try {
-    //         V fetched_value = fetcher_(key);
-    //         size_t value_size = sizeof(V);
-    //         entry_ptr = new V(fetched_value);
-
-    //         {
-    //             std::lock_guard<std::mutex> lock(combined_mutex_);
-    //             typename cache_type::accessor write_accessor;
-    //             cache_.find(write_accessor, key);
-    //             auto& entry = write_accessor->second;
-
-    //             entry.value = std::shared_ptr<V>(entry_ptr);
-    //             entry.key = key;
-    //             entry.size = value_size;
-
-    //             lru_.push_front({key, value_size});
-    //             lru_map_.insert_or_assign(key, lru_.begin());
-    //             current_memory_.fetch_add(value_size, std::memory_order_relaxed);
-    //             lru_memory_.fetch_add(value_size, std::memory_order_relaxed);
-
-    //             while (current_memory_.load(std::memory_order_relaxed) > max_memory_) {
-    //                 evict_lru();
-    //             }
-
-    //             entry.promise->set_value(entry.value);
-    //             entry.is_fetching = false;
-    //             return entry.value;
-    //         }
-    //     } catch (...) {
-    //         delete entry_ptr;
-    //         typename cache_type::accessor write_accessor;
-    //         cache_.find(write_accessor, key);
-    //         auto& entry = write_accessor->second;
-    //         entry.promise->set_exception(std::current_exception());
-    //         entry.is_fetching = false;
-    //         throw;
-    //     }
-    // } 
-    std::shared_ptr<V> get(const K& key) {
-        typename cache_type::accessor accessor;
-
-        if (cache_.find(accessor, key)) {
-            auto& entry = accessor->second;
-            if (entry.value) {
-                accessor.release();
-                return entry.value;
-            }
-        } else {
-            cache_.insert(accessor, key);
-        }
-
-        auto& entry = accessor->second;
-        std::shared_ptr<std::promise<std::shared_ptr<V>>> local_promise;
-        std::shared_future<std::shared_ptr<V>> shared_future;
-
-        {
-            std::unique_lock<std::mutex> lock(entry.mutex);
-            if (entry.value) {
-                accessor.release();
-                return entry.value;
-            }
-
-            if (!entry.is_fetching) {
-                entry.is_fetching = true;
-                local_promise = entry.promise = std::make_shared<std::promise<std::shared_ptr<V>>>();
-                entry.shared_future = local_promise->get_future().share();
-            } else {
-                local_promise = entry.promise;
-                shared_future = entry.shared_future;
-            }
-        } // Release entry.mutex lock
-
-        accessor.release();
-
-        if (!local_promise) {
-            return shared_future.get();
-        }
-
-        std::shared_ptr<V> value_ptr;
-        try {
-            value_ptr = fetch_and_insert(key); // Fetch and insert
-
-            { // Lock combined_mutex_ for setting the promise value
-                std::unique_lock<std::mutex> lock(combined_mutex_); // Use unique_lock
-                if (entry.promise == local_promise) { // Double-check before setting
-                    local_promise->set_value(value_ptr); // Set the value *inside* combined_mutex_
-                }
-            }
-            entry.is_fetching = false;
-
-        } catch (...) {
-            try {
-                std::unique_lock<std::mutex> lock(combined_mutex_); // Use unique_lock
-                if (entry.promise == local_promise) {
-                    local_promise->set_exception(std::current_exception()); // Set exception *inside* combined_mutex_
-                }
-            } catch (const std::future_error& e) {
-                if (e.code() != std::future_errc::promise_already_satisfied) {
-                    std::cerr << "Unexpected future_error setting exception: " << e.what() << std::endl;
-                }
-            }
-            entry.is_fetching = false;
-            throw;
-        }
-        return shared_future.get();
+    // For std::shared_ptr<T>, when T has capacity()
+    template <typename T>
+        requires HasCapacity<T>
+    constexpr size_t get_size(const std::shared_ptr<T>& value) noexcept {
+        return get_size(*value);
     }
-//test change
-    // New helper function to perform the fetch and insertion
-    std::shared_ptr<V> fetch_and_insert(const K& key) {
-        V fetched_value = fetcher_(key); // Fetch value
-        size_t value_size = sizeof(V);
-        std::shared_ptr<V> value_ptr = std::make_shared<V>(fetched_value); // Create shared_ptr
 
-        {
-            std::lock_guard<std::mutex> lock(combined_mutex_); // Lock for LRU and memory
-            typename cache_type::accessor write_accessor;
-            cache_.find(write_accessor, key);
-            auto& entry = write_accessor->second;
+    // Next, for types that have size(), but not capacity()
+    template <typename T>
+        requires (!HasCapacity<T>) && HasSize<T>
+    constexpr size_t get_size(const T& value) noexcept {
+        return sizeof(T) + value.size() * sizeof(typename T::value_type);
+    }
 
-            entry.value = value_ptr;
-            entry.key = key;
-            entry.size = value_size;
+    // For std::shared_ptr<T>, when T has size(), but not capacity()
+    template <typename T>
+        requires (!HasCapacity<T>) && HasSize<T>
+    constexpr size_t get_size(const std::shared_ptr<T>& value) noexcept {
+        return get_size(*value);
+    }
 
-            lru_.push_front({key, value_size});
-            lru_map_.insert_or_assign(key, lru_.begin());
-            current_memory_.fetch_add(value_size, std::memory_order_relaxed);
-            lru_memory_.fetch_add(value_size, std::memory_order_relaxed);
+    // Finally, fallback for other types
+    template <typename T>
+        requires (!HasCapacity<T>) && (!HasSize<T>)
+    constexpr size_t get_size(const T& /*value*/) noexcept {
+        return sizeof(T);
+    }
 
+    // For std::shared_ptr<T>, fallback
+    template <typename T>
+        requires (!HasCapacity<T>) && (!HasSize<T>)
+    constexpr size_t get_size(const std::shared_ptr<T>& value) noexcept {
+        return get_size(*value);
+    }
+
+    // HasGetSize concept
+    template <typename T>
+    concept HasGetSize = requires(const T & value) {
+        { get_size(value) } noexcept -> std::convertible_to<size_t>;
+    };
+
+    // Forward declaration
+    template<typename K, typename V>
+    class concurrent_value_cache;
+
+    // Custom Deleter to move entries to inactive cache
+    template<typename K, typename V>
+    class CacheEntryDeleter {
+    public:
+        CacheEntryDeleter(concurrent_value_cache<K, V>* cache, const K& key)
+            : cache_(cache), key_(key) {
+        }
+
+        void operator()(V* ptr);
+
+    private:
+        concurrent_value_cache<K, V>* cache_;
+        K key_;
+    };
+
+    // The main cache class
+    template<typename K, typename V>
+    class concurrent_value_cache {
+    private:
+        using CacheMap = tbb::concurrent_hash_map<K, std::weak_ptr<V>>;
+        using InactiveCacheMap = tbb::concurrent_hash_map<K, std::unique_ptr<V>>;
+        using PendingFetchMap = tbb::concurrent_hash_map<K, std::shared_future<std::shared_ptr<V>>>;
+
+        CacheMap active_cache_;
+        InactiveCacheMap inactive_cache_;
+        PendingFetchMap pending_fetches_;
+
+        // LRU list to track usage
+        tbb::concurrent_queue<K> lru_queue_;
+        std::unordered_map<K, typename tbb::concurrent_queue<K>::iterator> lru_map_;
+        mutable std::mutex lru_mutex_;
+
+        // Memory management for inactive items
+        size_t max_memory_;
+        std::atomic<size_t> current_memory_{ 0 };
+
+        // Statistics
+        std::atomic<size_t> reactivation_count_{ 0 };
+        std::atomic<size_t> second_consumer_count_{ 0 };
+        std::atomic<size_t> eviction_count_{ 0 };
+
+        // Fetcher function to retrieve values
+        std::function<V(const K&)> fetcher_;
+
+        // Mutex for promotion operations
+        mutable std::mutex promotion_mutex_;
+
+    public:
+        concurrent_value_cache(std::function<V(const K&)> fetcher, size_t max_memory)
+            : fetcher_(std::move(fetcher)), max_memory_(max_memory) {
+        }
+
+        // Disable copy and move semantics
+        concurrent_value_cache(const concurrent_value_cache&) = delete;
+        concurrent_value_cache& operator=(const concurrent_value_cache&) = delete;
+
+        // Get function to retrieve or fetch values
+        std::shared_ptr<V> get(const K& key) {
+            // Attempt to find in active cache
+            {
+                CacheMap::const_accessor accessor;
+                if (active_cache_.find(accessor, key)) {
+                    if (auto sp = accessor->second.lock()) {
+                        second_consumer_count_.fetch_add(1);
+                        touch_lru(key);
+                        return sp;
+                    }
+                }
+            }
+
+            // Attempt to find in inactive cache
+            {
+                auto sp = try_promote_to_active(key);
+                if (sp) return sp;
+            }
+
+            std::shared_future<std::shared_ptr<V>> shared_fut;
+            std::shared_ptr<std::promise<std::shared_ptr<V>>> fetch_promise;
+            bool need_to_fetch = false;
+
+            // Lock pending_mutex_ only while accessing pending_fetches_
+            {
+                PendingFetchMap::accessor accessor;
+                if (pending_fetches_.find(accessor, key)) {
+                    // Fetch is already in progress; use the existing shared_future
+                    shared_fut = accessor->second;
+                }
+                else {
+                    // No fetch in progress; initiate one
+                    std::promise<std::shared_ptr<V>> promise;
+                    shared_fut = promise.get_future().share();
+                    pending_fetches_.insert(accessor, key);
+                    accessor->second = shared_fut;
+
+                    // Prepare to perform the fetch outside the mutex
+                    fetch_promise = std::make_shared<std::promise<std::shared_ptr<V>>>(std::move(promise));
+                    need_to_fetch = true;
+                }
+            }
+
+            if (need_to_fetch) {
+                // Perform the fetch outside the mutex
+                std::shared_ptr<V> sp;
+                try {
+                    V fetched_value = fetcher_(key);
+                    sp = std::shared_ptr<V>(new V(std::move(fetched_value)),
+                        CacheEntryDeleter<K, V>(this, key));
+
+                    // Insert into active cache without affecting current_memory_
+                    {
+                        CacheMap::accessor accessor;
+                        active_cache_.insert(accessor, key);
+                        accessor->second = sp;
+                        // No change to current_memory_ since active items are not tracked
+                    }
+
+                    touch_lru(key);
+
+                    // Fulfill the promise with the fetched value
+                    fetch_promise->set_value(sp);
+                }
+                catch (...) {
+                    // Set the exception to notify all waiting threads
+                    fetch_promise->set_exception(std::current_exception());
+                }
+
+                // Remove the key from pending_fetches_ after successful fetch
+                {
+                    PendingFetchMap::accessor accessor;
+                    if (pending_fetches_.find(accessor, key)) {
+                        pending_fetches_.erase(accessor);
+                    }
+                }
+
+                // Return the fetched value directly
+                return sp;
+            }
+            else {
+                // Wait for the fetch to complete and return the result
+                return shared_fut.get();
+            }
+        }
+
+        // Statistics getters
+        size_t get_reactivation_count() const { return reactivation_count_.load(); }
+        size_t get_second_consumer_count() const { return second_consumer_count_.load(); }
+        size_t get_eviction_count() const { return eviction_count_.load(); }
+
+        // Get current cache size
+        size_t get_lru_size() const {
+            std::lock_guard lock(lru_mutex_);
+            return lru_map_.size();
+        }
+
+    private:
+        // Promote an entry from inactive to active cache
+        std::shared_ptr<V> try_promote_to_active(const K& key) {
+            std::lock_guard lock(promotion_mutex_);
+
+            // Remove from inactive cache and decrement current_memory_
+            std::unique_ptr<V> up;
+            {
+                InactiveCacheMap::accessor accessor;
+                if (inactive_cache_.find(accessor, key)) {
+                    up = std::move(accessor->second);
+                    inactive_cache_.erase(accessor);
+                    current_memory_.fetch_sub(get_size(*up), std::memory_order_relaxed);
+                }
+            }
+
+            std::shared_ptr<V> sp;
+            if (!up) return sp;
+
+            // Insert into active cache
+            {
+                CacheMap::accessor accessor;
+                active_cache_.insert(accessor, key);
+                sp = std::shared_ptr<V>(up.release(),
+                    CacheEntryDeleter<K, V>(this, key));
+                accessor->second = sp;
+                // No change to current_memory_ since active items are not tracked
+            }
+            reactivation_count_.fetch_add(1);
+            touch_lru(key);
+            return sp;
+        }
+
+        // Move an entry to the inactive cache
+        void move_to_inactive(const K& key, std::unique_ptr<V> sp) {
+            size_t value_size = get_size(*sp);
+            // Insert into inactive cache and increment current_memory_
+            {
+                InactiveCacheMap::accessor accessor;
+                inactive_cache_.insert(accessor, key);
+                accessor->second = std::move(sp);
+                current_memory_.fetch_add(value_size, std::memory_order_relaxed);
+            }
+
+            // Remove from active cache
+            {
+                CacheMap::accessor accessor;
+                if (active_cache_.find(accessor, key)) {
+                    active_cache_.erase(accessor);
+                }
+            }
+            enforce_memory_limit();
+        }
+
+        // Update LRU list
+        void touch_lru(const K& key) {
+            lru_queue_.push(key);
+        }
+
+        // Enforce memory limit by evicting least recently used items from inactive cache
+        void enforce_memory_limit() {
             while (current_memory_.load(std::memory_order_relaxed) > max_memory_) {
-                evict_lru();
+                K least_used_key;
+                if (!lru_queue_.try_pop(least_used_key)) {
+                    break;
+                }
+                eviction_count_.fetch_add(1);
+                {
+                    InactiveCacheMap::accessor accessor;
+                    if (inactive_cache_.find(accessor, least_used_key)) {
+                        current_memory_.fetch_sub(get_size(*accessor->second), std::memory_order_relaxed);
+                        inactive_cache_.erase(accessor);
+                    }
+                }
             }
-        } // Release combined_mutex_ lock
-        return value_ptr;
-    }    
-    void clear() {
-        std::lock_guard<std::mutex> lock(combined_mutex_);
-        cache_.clear();
-        current_memory_.store(0, std::memory_order_relaxed);
-        lru_memory_.store(0, std::memory_order_relaxed);
-        lru_.clear();
-        lru_map_.clear();
-    }
+        }
 
-    size_t get_lru_size() const {
-        return lru_memory_.load(std::memory_order_relaxed);
-    }
+        // Calculate the size of the value
+        friend class CacheEntryDeleter<K, V>;
+    };
 
-    size_t get_reactivation_count() const { return reactivation_count_.load(std::memory_order_relaxed); }
-    size_t get_second_consumer_count() const { return second_consumer_count_.load(std::memory_order_relaxed); }
-    size_t get_eviction_count() const { return eviction_count_.load(std::memory_order_relaxed); }
-
-    ~concurrent_value_cache() {
-        clear();
+    // Definition of the custom deleter
+    template<typename K, typename V>
+    void CacheEntryDeleter<K, V>::operator()(V* ptr) {
+        // Move the entry to inactive cache
+        cache_->move_to_inactive(key_, std::unique_ptr<V>(ptr));
     }
-};
 
 } // namespace tnt::caching::gemini2

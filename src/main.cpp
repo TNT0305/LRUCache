@@ -30,8 +30,7 @@ int main() {
         [&fetches](const std::string& key) {
             fetches++;
             return TestValue(key + "_value");
-        },
-        max_memory
+        }, max_memory
     );
 
     std::vector<std::thread> threads;
@@ -47,7 +46,8 @@ int main() {
                 int key_index = distrib(gen);
                 std::string key = "key" + std::to_string(key_index);
                 auto val = cache.get(key);
-                assert(val->data == key + "_value");
+                auto d = key + "_value";
+                assert(val->data == d + std::string(1000 - d.length(), 'x'));
             }
         });
     }
@@ -68,8 +68,11 @@ int main() {
     
     std::cout << "Test completed." << std::endl;
     std::cout << "Time taken: " << duration.count() << "ms" << std::endl;
-    std::cout << "Total Fetches: " << fetches.load() << std::endl;
-    std::cout << "Expected Fetches (max): " << num_keys << std::endl;
+    std::cout << "Actual Fetches: " << fetches.load() << std::endl;
+    std::cout << "Total Fetches: " << num_iterations * num_threads << std::endl;
+    // Calculate and report the average time per fetch in milliseconds
+    double average_time_per_fetch = static_cast<double>(duration.count()) / (num_iterations * num_threads);
+    std::cout << "Average time per fetch: " << average_time_per_fetch << "ms" << std::endl;
     assert(fetches <= num_keys);
     std::cout << "Cache size: " << cache.get_lru_size() << std::endl;
 
