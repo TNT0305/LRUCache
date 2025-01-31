@@ -243,7 +243,9 @@ namespace tnt::caching::gemini2 {
                 if (inactive_cache_.find(accessor, key)) {
                     up = std::move(accessor->second);
                     inactive_cache_.erase(accessor);
-                    current_memory_.fetch_sub(get_size(*up), std::memory_order_relaxed);
+                    size_t value_size = get_size(*up);
+                    current_memory_.fetch_sub(value_size, std::memory_order_relaxed);
+                    //std::cout << "Promoted to active: " << key << ", size: " << value_size << ", current_memory_: " << current_memory_.load() << std::endl;
                     reactivation_count_.fetch_add(1);
                 }
             }
@@ -262,7 +264,7 @@ namespace tnt::caching::gemini2 {
             }
             return sp;
         }
-
+        std::mutex active_transition;
         // Move an entry to the inactive cache
         void move_to_inactive(const K& key, std::unique_ptr<V> sp) {
             size_t value_size = get_size(*sp);
@@ -272,11 +274,13 @@ namespace tnt::caching::gemini2 {
                 inactive_cache_.insert(accessor, key);
                 accessor->second = std::move(sp);
                 current_memory_.fetch_add(value_size, std::memory_order_relaxed);
+                //std::cout << "Moved to inactive: " << key << ", size: " << value_size << ", current_memory_: " << current_memory_.load() << std::endl;
             }
 
             // Add to LRU queue
             lru_queue_.enqueue(key);
 
+            std::lock_guard<std::mutex> lock(active_transition);
             // Remove from active cache
             {
                 CacheMap::accessor accessor;
@@ -292,17 +296,16 @@ namespace tnt::caching::gemini2 {
             while (current_memory_.load(std::memory_order_relaxed) > max_memory_) {
                 K least_used_key;
                 if (!lru_queue_.try_dequeue(least_used_key)) {
-					auto sz = current_memory_.load(std::memory_order_relaxed);
-                    auto cache_sz = inactive_cache_.size();
-					std::cout << "Memory limit exceeded: " << sz << " > " << max_memory_ << ", " << cache_sz << std::endl;
                     break;
                 }
                 {
                     InactiveCacheMap::accessor accessor;
                     if (inactive_cache_.find(accessor, least_used_key)) {
+                        size_t value_size = get_size(*accessor->second);
                         eviction_count_.fetch_add(1);
-                        current_memory_.fetch_sub(get_size(*accessor->second), std::memory_order_relaxed);
+                        current_memory_.fetch_sub(value_size, std::memory_order_relaxed);
                         inactive_cache_.erase(accessor);
+                        //std::cout << "Evicted: " << least_used_key << ", size: " << value_size << ", current_memory_: " << current_memory_.load() << std::endl;
                     }
                 }
             }
@@ -320,4 +323,5 @@ namespace tnt::caching::gemini2 {
     }
 
 } // namespace tnt::caching::gemini2
+
 
