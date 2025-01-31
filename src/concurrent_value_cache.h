@@ -9,6 +9,7 @@
 #include <tbb/concurrent_queue.h>
 #include <list>
 #include <future>
+#include "concurrentqueue.h" // Include the moodycamel concurrent queue
 
 namespace tnt::caching::gemini2 {
     // Helper function to calculate the size of a value
@@ -107,9 +108,7 @@ namespace tnt::caching::gemini2 {
         PendingFetchMap pending_fetches_;
 
         // LRU list to track usage
-        tbb::concurrent_queue<K> lru_queue_;
-        std::unordered_map<K, typename tbb::concurrent_queue<K>::iterator> lru_map_;
-        mutable std::mutex lru_mutex_;
+        moodycamel::ConcurrentQueue<K> lru_queue_;
 
         // Memory management for inactive items
         size_t max_memory_;
@@ -122,9 +121,6 @@ namespace tnt::caching::gemini2 {
 
         // Fetcher function to retrieve values
         std::function<V(const K&)> fetcher_;
-
-        // Mutex for promotion operations
-        mutable std::mutex promotion_mutex_;
 
     public:
         concurrent_value_cache(std::function<V(const K&)> fetcher, size_t max_memory)
@@ -229,15 +225,12 @@ namespace tnt::caching::gemini2 {
 
         // Get current cache size
         size_t get_lru_size() const {
-            std::lock_guard lock(lru_mutex_);
-            return lru_map_.size();
+            return current_memory_.load();
         }
 
     private:
         // Promote an entry from inactive to active cache
         std::shared_ptr<V> try_promote_to_active(const K& key) {
-            std::lock_guard lock(promotion_mutex_);
-
             // Remove from inactive cache and decrement current_memory_
             std::unique_ptr<V> up;
             {
@@ -289,14 +282,14 @@ namespace tnt::caching::gemini2 {
 
         // Update LRU list
         void touch_lru(const K& key) {
-            lru_queue_.push(key);
+            lru_queue_.enqueue(key);
         }
 
         // Enforce memory limit by evicting least recently used items from inactive cache
         void enforce_memory_limit() {
             while (current_memory_.load(std::memory_order_relaxed) > max_memory_) {
                 K least_used_key;
-                if (!lru_queue_.try_pop(least_used_key)) {
+                if (!lru_queue_.try_dequeue(least_used_key)) {
                     break;
                 }
                 eviction_count_.fetch_add(1);
