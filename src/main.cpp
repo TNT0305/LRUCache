@@ -15,8 +15,11 @@ struct TestValue {
     TestValue(const std::string& d) : data(d + std::string(1000 - d.length(), 'x')) {}
 };
 
-size_t get_size(const TestValue& tv) { // Correct signature
-    return tv.data.size();
+size_t get_size(const TestValue& value) { // Correct signature
+    // Account for actual string memory allocation, not just size
+    // std::string typically uses small string optimization (SSO) around 15-16 bytes
+    // For larger strings, it allocates on heap
+    return sizeof(TestValue) + (value.data.capacity() + 1) * sizeof(char);
 }
 
 int main() {

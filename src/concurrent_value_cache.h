@@ -132,7 +132,7 @@ namespace tnt::caching::gemini2 {
 
     public:
         concurrent_value_cache(std::function<V(const K&)> fetcher, size_t max_memory)
-            : fetcher_(std::move(fetcher)), max_memory_(max_memory) {
+            : max_memory_(max_memory), fetcher_(std::move(fetcher)) {
         }
 
         // Disable copy and move semantics
@@ -143,7 +143,7 @@ namespace tnt::caching::gemini2 {
         std::shared_ptr<V> get(const K& key) {
             // Attempt to find in active cache
             {
-                CacheMap::const_accessor accessor;
+                typename CacheMap::const_accessor accessor;
                 if (active_cache_.find(accessor, key)) {
                     if (auto sp = accessor->second.lock()) {
                         second_consumer_count_.fetch_add(1);
@@ -154,8 +154,7 @@ namespace tnt::caching::gemini2 {
 
             // Attempt to find in inactive cache
             {
-                auto sp = try_promote_to_active(key);
-                if (sp) return sp;
+	            if (auto sp = try_promote_to_active(key)) return sp;
             }
 
             std::shared_future<std::shared_ptr<V>> shared_fut;
@@ -164,7 +163,7 @@ namespace tnt::caching::gemini2 {
 
             // Lock pending_mutex_ only while accessing pending_fetches_
             {
-                PendingFetchMap::accessor accessor;
+                typename PendingFetchMap::accessor accessor;
                 if (pending_fetches_.find(accessor, key)) {
                     // Fetch is already in progress; use the existing shared_future
                     shared_fut = accessor->second;
@@ -192,7 +191,7 @@ namespace tnt::caching::gemini2 {
 
                     // Insert into active cache without affecting current_memory_
                     {
-                        CacheMap::accessor accessor;
+                        typename CacheMap::accessor accessor;
                         active_cache_.insert(accessor, key);
                         accessor->second = sp;
                         // No change to current_memory_ since active items are not tracked
@@ -208,7 +207,7 @@ namespace tnt::caching::gemini2 {
 
                 // Remove the key from pending_fetches_ after successful fetch
                 {
-                    PendingFetchMap::accessor accessor;
+                    typename PendingFetchMap::accessor accessor;
                     if (pending_fetches_.find(accessor, key)) {
                         pending_fetches_.erase(accessor);
                     }
@@ -217,10 +216,8 @@ namespace tnt::caching::gemini2 {
                 // Return the fetched value directly
                 return sp;
             }
-            else {
-                // Wait for the fetch to complete and return the result
-                return shared_fut.get();
-            }
+            // Wait for the fetch to complete and return the result
+            return shared_fut.get();
         }
 
         // Statistics getters
@@ -230,7 +227,7 @@ namespace tnt::caching::gemini2 {
 
         // Get current cache size
         size_t get_lru_size() const {
-            return current_memory_.load();
+            return current_memory_.load(std::memory_order_acquire);
         }
 
     private:
@@ -239,7 +236,7 @@ namespace tnt::caching::gemini2 {
             // Remove from inactive cache and decrement current_memory_
             std::unique_ptr<V> up;
             {
-                InactiveCacheMap::accessor accessor;
+                typename InactiveCacheMap::accessor accessor;
                 if (inactive_cache_.find(accessor, key)) {
                     up = std::move(accessor->second);
                     inactive_cache_.erase(accessor);
@@ -255,7 +252,7 @@ namespace tnt::caching::gemini2 {
 
             // Insert into active cache
             {
-                CacheMap::accessor accessor;
+                typename CacheMap::accessor accessor;
                 active_cache_.insert(accessor, key);
                 sp = std::shared_ptr<V>(up.release(),
                     CacheEntryDeleter<K, V>(this, key));
@@ -264,31 +261,59 @@ namespace tnt::caching::gemini2 {
             }
             return sp;
         }
-        std::mutex active_transition;
         // Move an entry to the inactive cache
         void move_to_inactive(const K& key, std::unique_ptr<V> sp) {
+            if (!sp) return;
             size_t value_size = get_size(*sp);
-            // Insert into inactive cache and increment current_memory_
-            {
-                InactiveCacheMap::accessor accessor;
-                inactive_cache_.insert(accessor, key);
-                accessor->second = std::move(sp);
-                current_memory_.fetch_add(value_size, std::memory_order_relaxed);
-                //std::cout << "Moved to inactive: " << key << ", size: " << value_size << ", current_memory_: " << current_memory_.load() << std::endl;
-            }
 
-            // Add to LRU queue
-            lru_queue_.enqueue(key);
+            // Check and enforce memory limit before insertion
+            while (true) {
+                auto current_mem = current_memory_.load(std::memory_order_acquire);
+                if (current_mem + value_size <= max_memory_) {
+                    // Try to reserve space
+                    if (current_memory_.compare_exchange_weak(current_mem,
+                        current_mem + value_size,
+                        std::memory_order_acq_rel,
+                        std::memory_order_acquire)) {
+                        break;  // Successfully reserved space
+                    }
+                    continue;  // Try again if CAS failed
+                }
 
-            std::lock_guard<std::mutex> lock(active_transition);
-            // Remove from active cache
-            {
-                CacheMap::accessor accessor;
-                if (active_cache_.find(accessor, key)) {
-                    active_cache_.erase(accessor);
+                // Need to evict
+                K least_used_key;
+                if (!lru_queue_.try_dequeue(least_used_key)) break;
+
+                typename InactiveCacheMap::accessor evict_accessor;
+                if (inactive_cache_.find(evict_accessor, least_used_key)) {
+                    size_t evicted_size = get_size(*evict_accessor->second);
+                    current_memory_.fetch_sub(evicted_size, std::memory_order_release);
+                    eviction_count_.fetch_add(1);
+                    inactive_cache_.erase(evict_accessor);
                 }
             }
-            enforce_memory_limit();
+
+            // First remove from active cache - use TBB's accessor for synchronization
+            {
+                typename CacheMap::accessor active_accessor;
+                if (active_cache_.find(active_accessor, key)) {
+                    active_cache_.erase(active_accessor);
+                }
+            }
+
+            // Now add to inactive cache
+            {
+                typename InactiveCacheMap::accessor inactive_accessor;
+                if (!inactive_cache_.find(inactive_accessor, key)) {
+                    inactive_cache_.insert(inactive_accessor, key);
+                    inactive_accessor->second = std::move(sp);
+                    lru_queue_.enqueue(key);
+                }
+                else {
+                    // Key already exists in inactive cache - unexpected case
+                    current_memory_.fetch_sub(value_size, std::memory_order_release);
+                }
+            }
         }
 
         // Enforce memory limit by evicting least recently used items from inactive cache
@@ -299,7 +324,7 @@ namespace tnt::caching::gemini2 {
                     break;
                 }
                 {
-                    InactiveCacheMap::accessor accessor;
+                    typename InactiveCacheMap::accessor accessor;
                     if (inactive_cache_.find(accessor, least_used_key)) {
                         size_t value_size = get_size(*accessor->second);
                         eviction_count_.fetch_add(1);
