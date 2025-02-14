@@ -22,7 +22,7 @@ size_t get_size(const TestValue& value) { // Correct signature
     return sizeof(TestValue) + (value.data.capacity() + 1) * sizeof(char);
 }
 
-int main_usage() {
+int main() {
     constexpr size_t num_custfunctions = 10;
     constexpr size_t elements_per_custfn = 100000;
     constexpr size_t total_unique_elements =
@@ -101,7 +101,7 @@ int main_usage() {
     return 0;
 }
 
-int main() {
+int main_original() {
     constexpr size_t num_threads = 32;
     constexpr size_t num_keys = 100000;
     constexpr size_t num_iterations = 100000;
