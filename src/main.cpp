@@ -22,12 +22,91 @@ size_t get_size(const TestValue& value) { // Correct signature
     return sizeof(TestValue) + (value.data.capacity() + 1) * sizeof(char);
 }
 
+int main_usage() {
+    constexpr size_t num_custfunctions = 10;
+    constexpr size_t elements_per_custfn = 100000;
+    constexpr size_t total_unique_elements =
+        static_cast<size_t>(elements_per_custfn * 1.1); // 10% unique elements (90% sharing)
+    constexpr size_t max_memory = 1024 * 1024 * 30; // 10 MB cache
+
+    std::atomic<size_t> fetches{ 0 };
+    auto cache = concurrent_value_cache<std::string, TestValue>(
+        [&fetches](const std::string& key) {
+            ++fetches;
+            return TestValue(key + "_value");
+        }, max_memory
+    );
+
+    // Create 10 custFunctions, each with their own thread
+    std::vector<std::thread> threads;
+    std::atomic<bool> keep_running{ true };
+    std::atomic<int> total_count{ 0 };
+
+    // Simulate real access patterns:
+    // 1. Each custFunction mainly accesses its own subset
+    // 2. But there's 90% overlap between them
+    auto start = std::chrono::high_resolution_clock::now();
+
+    for (size_t i = 0; i < num_custfunctions; ++i) {
+        threads.emplace_back([&, i]() {
+            std::random_device rd;
+            std::mt19937 gen(rd());
+
+            // Each custFunction has:
+            // - 90% access to shared elements (0 to 90% of total_unique_elements)
+            // - 10% access to its own unique elements (90% + i*1% to 90% + (i+1)*1% of total_unique_elements)
+            std::uniform_int_distribution<> shared_dist(0, static_cast<int>(total_unique_elements * 0.9));
+            std::uniform_int_distribution<> unique_dist(
+                static_cast<int>(total_unique_elements * 0.9 + i * 0.01 * total_unique_elements),
+                static_cast<int>(total_unique_elements * 0.9 + (i + 1) * 0.01 * total_unique_elements)
+            ); 
+            // Simulate continuous access
+            while (keep_running) {
+                ++total_count;
+                // 90% probability of accessing shared elements
+                if (gen() % 100 < 90) {
+                    std::string key = "shared_" + std::to_string(shared_dist(gen));
+                    auto val = cache.get(key);
+                }
+                else {
+                    std::string key = "unique_" + std::to_string(unique_dist(gen));
+                    auto val = cache.get(key);
+                }
+            }
+            });
+    }
+
+    // Let it run for 5 seconds
+    std::this_thread::sleep_for(std::chrono::seconds(10));
+    keep_running = false;
+
+    for (auto& thread : threads) {
+        thread.join();
+    }
+
+    auto end = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+
+    std::cout << "Test Statistics:\n";
+    std::cout << "Duration: " << duration.count() << "ms\n";
+    std::cout << "Fetches: " << fetches.load() << "\n";
+    std::cout << "Cache size: " << cache.get_lru_size() << "\n";
+    std::cout << "Reactivations: " << cache.get_reactivation_count() << "\n";
+    std::cout << "Second Consumers: " << cache.get_second_consumer_count() << "\n";
+    std::cout << "Evictions: " << cache.get_eviction_count() << "\n";
+	std::cout << "Total count: " << total_count.load() << "\n";
+    double average_time_per_fetch = static_cast<double>(duration.count()) / (total_count.load());
+    std::cout << "Average time per fetch: " << average_time_per_fetch << "ms" << std::endl;
+
+    return 0;
+}
+
 int main() {
     constexpr size_t num_threads = 32;
     constexpr size_t num_keys = 100000;
     constexpr size_t num_iterations = 100000;
     //constexpr size_t max_memory = 1024 * 1024; 
-    constexpr size_t max_memory = 1024 * 1024 * 10; // Increase cache size to 10 MB
+    constexpr size_t max_memory = 1024 * 1024 * 30; // Increase cache size to 10 MB
 
     std::atomic<size_t> fetches{ 0 };
     auto cache = concurrent_value_cache<std::string, TestValue>(
